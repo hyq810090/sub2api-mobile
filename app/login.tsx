@@ -2,12 +2,12 @@ import { Redirect, router } from 'expo-router';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { Controller, useForm } from 'react-hook-form';
 import { Pressable, ScrollView, Text, TextInput, View } from 'react-native';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { z } from 'zod';
 
-import { getAdminSettings, getDashboardStats } from '@/src/services/admin';
-import { queryClient } from '@/src/lib/query-client';
+import { verifyAdminConnection } from '@/src/lib/admin-fetch';
+import { getManagementError } from '@/src/lib/management';
 import { adminConfigState, hasAuthenticatedAdminSession, saveAdminConfig } from '@/src/store/admin-config';
 
 const { useSnapshot } = require('valtio/react');
@@ -67,6 +67,9 @@ export default function LoginScreen() {
   const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
   const [connectionMessage, setConnectionMessage] = useState('');
   const [showAdminKey, setShowAdminKey] = useState(false);
+  const submitting = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
 
   if (hasAccount) {
     return <Redirect href="/monitor" />;
@@ -167,19 +170,22 @@ export default function LoginScreen() {
               style={{ backgroundColor: connectionState === 'checking' ? '#7ca89f' : colors.primary, borderRadius: 18, paddingVertical: 15, alignItems: 'center' }}
               disabled={connectionState === 'checking'}
               onPress={handleSubmit(async (values) => {
+                if (submitting.current) return;
+                submitting.current = true;
+                const revision = adminConfigState.sessionRevision;
                 setConnectionState('checking');
                 setConnectionMessage('正在验证服务器连接...');
 
                 try {
+                  await verifyAdminConnection(values);
+                  if (!mounted.current || revision !== adminConfigState.sessionRevision) return;
                   await saveAdminConfig(values);
-                  queryClient.clear();
-                  await queryClient.fetchQuery({ queryKey: ['admin-settings'], queryFn: getAdminSettings });
-                  await queryClient.prefetchQuery({ queryKey: ['monitor-stats'], queryFn: getDashboardStats });
                   router.replace('/monitor');
                 } catch (error) {
+                  if (!mounted.current) return;
                   setConnectionState('error');
-                  setConnectionMessage(getConnectionErrorMessage(error));
-                }
+                  setConnectionMessage(getManagementError(error));
+                } finally { submitting.current = false; }
               })}
             >
               <Text style={{ color: '#fff', fontSize: 15, fontWeight: '700' }}>{connectionState === 'checking' ? '连接中...' : '进入应用'}</Text>

@@ -1,5 +1,6 @@
 import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
+import { queryClient } from '@/src/lib/query-client';
 const { proxy } = require('valtio');
 
 const BASE_URL_KEY = 'sub2api_base_url';
@@ -79,10 +80,6 @@ export function hasAuthenticatedAdminSession(config: { baseUrl: string; adminApi
     return false;
   }
 
-  if (!IS_WEB) {
-    return true;
-  }
-
   return Boolean(config.adminApiKey.trim());
 }
 
@@ -160,7 +157,18 @@ export const adminConfigState = proxy({
   activeAccountId: '',
   hydrated: false,
   saving: false,
+  sessionRevision: 0,
 });
+
+function activateSession(account?: AdminAccountProfile) {
+  // Cancel old reads and remove their cache before activating another server.
+  adminConfigState.sessionRevision += 1;
+  void queryClient.cancelQueries();
+  queryClient.clear();
+  adminConfigState.activeAccountId = account?.id ?? '';
+  adminConfigState.baseUrl = account?.baseUrl ?? '';
+  adminConfigState.adminApiKey = account?.adminApiKey ?? '';
+}
 
 export async function hydrateAdminConfig() {
   const defaults = getDefaultAdminConfig();
@@ -206,9 +214,7 @@ export async function hydrateAdminConfig() {
     const nextActiveAccountId = activeAccount?.id || '';
 
     adminConfigState.accounts = sortedAccounts;
-    adminConfigState.activeAccountId = nextActiveAccountId;
-    adminConfigState.baseUrl = activeAccount?.baseUrl ?? defaults.baseUrl;
-    adminConfigState.adminApiKey = activeAccount?.adminApiKey ?? defaults.adminApiKey;
+    activateSession(activeAccount);
 
     await Promise.all([
       persistAccounts(sortedAccounts),
@@ -256,9 +262,7 @@ export async function saveAdminConfig(input: { baseUrl: string; adminApiKey: str
     ]);
 
     adminConfigState.accounts = nextAccounts;
-    adminConfigState.activeAccountId = nextAccount.id;
-    adminConfigState.baseUrl = normalized.baseUrl;
-    adminConfigState.adminApiKey = normalized.adminApiKey;
+    activateSession(nextAccount);
   } finally {
     adminConfigState.saving = false;
   }
@@ -292,9 +296,7 @@ export async function switchAdminAccount(accountId: string) {
   ]);
 
   adminConfigState.accounts = nextAccounts;
-  adminConfigState.activeAccountId = nextAccount.id;
-  adminConfigState.baseUrl = nextAccount.baseUrl;
-  adminConfigState.adminApiKey = nextAccount.adminApiKey;
+  activateSession(nextAccount);
 }
 
 export async function removeAdminAccount(accountId: string) {
@@ -309,17 +311,13 @@ export async function removeAdminAccount(accountId: string) {
   ]);
 
   adminConfigState.accounts = nextAccounts;
-  adminConfigState.activeAccountId = nextActiveAccount?.id ?? '';
-  adminConfigState.baseUrl = nextActiveAccount?.baseUrl ?? '';
-  adminConfigState.adminApiKey = nextActiveAccount?.adminApiKey ?? '';
+  activateSession(nextActiveAccount);
 }
 
 export async function logoutAdminAccount() {
   await Promise.all([setItem(BASE_URL_KEY, ''), persistAdminApiKey(''), deleteItem(ACTIVE_ACCOUNT_ID_KEY)]);
 
-  adminConfigState.activeAccountId = '';
-  adminConfigState.baseUrl = '';
-  adminConfigState.adminApiKey = '';
+  activateSession();
 }
 
 export async function setAdminAccountEnabled(accountId: string, enabled: boolean) {
@@ -338,7 +336,5 @@ export async function setAdminAccountEnabled(accountId: string, enabled: boolean
   ]);
 
   adminConfigState.accounts = nextAccounts;
-  adminConfigState.activeAccountId = nextActiveAccount?.id ?? '';
-  adminConfigState.baseUrl = nextActiveAccount?.baseUrl ?? '';
-  adminConfigState.adminApiKey = nextActiveAccount?.adminApiKey ?? '';
+  activateSession(nextActiveAccount);
 }

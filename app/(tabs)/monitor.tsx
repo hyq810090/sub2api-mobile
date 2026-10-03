@@ -30,15 +30,15 @@ const colors = {
 };
 
 const RANGE_OPTIONS: Array<{ key: RangeKey; label: string }> = [
-  { key: '24h', label: '24H' },
-  { key: '7d', label: '7D' },
-  { key: '30d', label: '30D' },
+  { key: '24h', label: '今日' },
+  { key: '7d', label: '7天' },
+  { key: '30d', label: '30天' },
 ];
 
 const RANGE_TITLE_MAP: Record<RangeKey, string> = {
-  '24h': '24H',
-  '7d': '7D',
-  '30d': '30D',
+  '24h': '今日',
+  '7d': '近7天',
+  '30d': '近30天',
 };
 
 function hasAccountError(account: { status?: string; error_message?: string | null }) {
@@ -78,14 +78,14 @@ function getDateRange(rangeKey: RangeKey) {
   const start = new Date();
 
   if (rangeKey === '24h') {
-    start.setHours(end.getHours() - 23, 0, 0, 0);
+    start.setHours(0, 0, 0, 0);
   } else if (rangeKey === '30d') {
     start.setDate(end.getDate() - 29);
   } else {
     start.setDate(end.getDate() - 6);
   }
 
-  const toDate = (value: Date) => value.toISOString().slice(0, 10);
+  const toDate = (value: Date) => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
 
   return {
     start_date: toDate(start),
@@ -166,11 +166,23 @@ function StatCard({ title, value, detail }: { title: string; value: string; deta
   );
 }
 
+function QueryNotice({ label, error, loading, retry }: { label: string; error?: unknown; loading?: boolean; retry: () => void }) {
+  if (!error && !loading) return null;
+  return (
+    <View style={{ backgroundColor: error ? colors.dangerBg : colors.card, borderRadius: 14, padding: 14, gap: 8 }}>
+      <Text style={{ fontSize: 12, lineHeight: 18, color: error ? colors.danger : colors.subtext }}>
+        {error ? `${label}加载失败：${getErrorMessage(error)}` : `正在加载${label}…`}
+      </Text>
+      {error ? <Pressable onPress={retry} style={{ paddingVertical: 8 }}><Text style={{ fontSize: 13, fontWeight: '700', color: colors.primary }}>重试{label}</Text></Pressable> : null}
+    </View>
+  );
+}
+
 export default function MonitorScreen() {
   const config = useSnapshot(adminConfigState);
   const hasAccount = hasAuthenticatedAdminSession(config);
   const [rangeKey, setRangeKey] = useState<RangeKey>('7d');
-  const range = useMemo(() => getDateRange(rangeKey), [rangeKey]);
+  const range = getDateRange(rangeKey);
 
   const statsQuery = useQuery({
     queryKey: ['monitor-stats'],
@@ -195,14 +207,12 @@ export default function MonitorScreen() {
     queryFn: () => getDashboardTrend(range),
     enabled: hasAccount,
     staleTime: 60_000,
-    placeholderData: (previousData) => previousData,
   });
   const modelsQuery = useQuery({
     queryKey: ['monitor-models', rangeKey, range.start_date, range.end_date],
     queryFn: () => getDashboardModels(range),
     enabled: hasAccount,
     staleTime: 60_000,
-    placeholderData: (previousData) => previousData,
   });
 
   function refetchAll() {
@@ -218,24 +228,25 @@ export default function MonitorScreen() {
   const accounts = accountsQuery.data?.items ?? [];
   const trend = trendQuery.data?.trend ?? [];
   const topModels = (modelsQuery.data?.models ?? []).slice(0, 5);
-  const errorMessage = getErrorMessage(statsQuery.error ?? settingsQuery.error ?? accountsQuery.error ?? trendQuery.error ?? modelsQuery.error);
-  const currentPageErrorAccounts = accounts.filter(hasAccountError).length;
-  const currentPageLimitedAccounts = accounts.filter((item) => hasAccountRateLimited(item)).length;
-  const currentPageBusyAccounts = accounts.filter((item) => {
-    if (hasAccountError(item) || hasAccountRateLimited(item)) return false;
-    return (item.current_concurrency ?? 0) > 0;
-  }).length;
-  const totalAccounts = stats?.total_accounts ?? accountsQuery.data?.total ?? accounts.length;
-  const aggregatedErrorAccounts = stats?.error_accounts ?? 0;
-  const errorAccounts = Math.max(aggregatedErrorAccounts, currentPageErrorAccounts);
-  const healthyAccounts = stats?.normal_accounts ?? Math.max(totalAccounts - errorAccounts, 0);
+  const errorMessage = getErrorMessage(statsQuery.error);
+  const sampleStatus = { healthy: 0, paused: 0, busy: 0, limited: 0, error: 0 };
+  for (const account of accounts) {
+    if (hasAccountError(account)) sampleStatus.error += 1;
+    else if (account.schedulable === false || ['inactive', 'disabled', 'paused'].includes(account.status ?? '')) sampleStatus.paused += 1;
+    else if (hasAccountRateLimited(account)) sampleStatus.limited += 1;
+    else if ((account.current_concurrency ?? 0) > 0) sampleStatus.busy += 1;
+    else sampleStatus.healthy += 1;
+  }
+  const totalAccounts = stats?.total_accounts ?? accountsQuery.data?.total;
+  const errorAccounts = stats?.error_accounts;
+  const healthyAccounts = stats?.normal_accounts;
   const latestTrendPoints = trend.slice(-6).reverse();
-  const selectedTokenTotal = trend.reduce((sum, item) => sum + item.total_tokens, 0);
-  const selectedCostTotal = trend.reduce((sum, item) => sum + item.cost, 0);
-  const selectedOutputTotal = trend.reduce((sum, item) => sum + item.output_tokens, 0);
+  const selectedTokenTotal = trendQuery.data ? trend.reduce((sum, item) => sum + item.total_tokens, 0) : undefined;
+  const selectedCostTotal = trendQuery.data ? trend.reduce((sum, item) => sum + item.cost, 0) : undefined;
+  const selectedOutputTotal = trendQuery.data ? trend.reduce((sum, item) => sum + item.output_tokens, 0) : undefined;
   const rangeTitle = RANGE_TITLE_MAP[rangeKey];
-  const isLoading = statsQuery.isLoading || settingsQuery.isLoading || accountsQuery.isLoading;
-  const hasError = Boolean(statsQuery.error || settingsQuery.error || accountsQuery.error || trendQuery.error || modelsQuery.error);
+  const isLoading = statsQuery.isPending;
+  const hasError = Boolean(statsQuery.error && !stats);
 
   const throughputPoints = useMemo(
     () => trend.map((item) => ({ label: getPointLabel(item.date, rangeKey), value: item.total_tokens })),
@@ -295,7 +306,7 @@ export default function MonitorScreen() {
           </Section>
         ) : isLoading ? (
           <Section title="正在加载概览" subtitle="请稍候">
-            <Text style={{ fontSize: 14, lineHeight: 22, color: colors.subtext }}>已连接服务器，正在拉取概览、模型和账号状态数据。</Text>
+            <Text style={{ fontSize: 14, lineHeight: 22, color: colors.subtext }}>正在查询服务器运行统计…</Text>
           </Section>
         ) : hasError ? (
           <Section title="加载失败" subtitle="请检查连接配置">
@@ -306,38 +317,52 @@ export default function MonitorScreen() {
               <Pressable style={{ flex: 1, backgroundColor: colors.primary, borderRadius: 14, paddingVertical: 12, alignItems: 'center' }} onPress={refetchAll}>
                 <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700' }}>重试</Text>
               </Pressable>
-              <Pressable style={{ flex: 1, backgroundColor: colors.border, borderRadius: 14, paddingVertical: 12, alignItems: 'center' }} onPress={() => router.push('/settings')}>
-                <Text style={{ color: '#4e463e', fontSize: 13, fontWeight: '700' }}>检查服务器</Text>
-              </Pressable>
             </View>
           </Section>
         ) : (
           <View style={{ gap: 12 }}>
+            <View style={{ flexDirection: 'row', gap: 10 }}>
+              <Pressable onPress={() => router.push('/users')} style={{ flex: 1, backgroundColor: colors.primary, borderRadius: 14, padding: 14 }}>
+                <Text style={{ color: '#fff', fontSize: 14, fontWeight: '700' }}>用户管理 ›</Text>
+                <Text style={{ marginTop: 5, color: '#d7eee6', fontSize: 11 }}>余额、额度与订阅</Text>
+              </Pressable>
+              <Pressable onPress={() => router.push('/accounts')} style={{ flex: 1, backgroundColor: colors.card, borderRadius: 14, padding: 14 }}>
+                <Text style={{ color: colors.primary, fontSize: 14, fontWeight: '700' }}>账号查询 ›</Text>
+                <Text style={{ marginTop: 5, color: colors.subtext, fontSize: 11 }}>限额、用量与重置卡</Text>
+              </Pressable>
+            </View>
+            <QueryNotice label="概览统计" error={statsQuery.error} retry={() => void statsQuery.refetch()} />
+            {statsQuery.error ? <Text style={{ color: colors.subtext, fontSize: 12 }}>当前保留上次成功查询的统计。</Text> : null}
+            <QueryNotice label="站点名称" error={settingsQuery.error} retry={() => void settingsQuery.refetch()} />
+            <View style={{ flexDirection: 'row', gap: 12 }}>
+              <StatCard title="今日请求" value={formatNumber(stats?.today_requests)} detail={`RPM ${formatNumber(stats?.rpm)}`} />
+              <StatCard title="活跃用户" value={formatNumber(stats?.active_users)} detail={`共 ${formatNumber(stats?.total_users)} 位用户`} />
+            </View>
             <View style={{ flexDirection: 'row', gap: 12 }}>
               <StatCard
                 title={`${rangeTitle} Token`}
-                value={formatTokenDisplay(rangeKey === '24h' ? selectedTokenTotal || stats?.today_tokens : selectedTokenTotal)}
-                detail={`输出 ${formatTokenDisplay(rangeKey === '24h' ? selectedOutputTotal || stats?.today_output_tokens : selectedOutputTotal)}`}
+                value={formatTokenDisplay(rangeKey === '24h' ? stats?.today_tokens : selectedTokenTotal)}
+                detail={`输出 ${formatTokenDisplay(rangeKey === '24h' ? stats?.today_output_tokens : selectedOutputTotal)}`}
               />
               <StatCard
                 title={`${rangeTitle} 成本`}
-                value={formatMoney(rangeKey === '24h' ? selectedCostTotal || stats?.today_cost : selectedCostTotal)}
+                value={formatMoney(rangeKey === '24h' ? stats?.today_cost : selectedCostTotal)}
                 detail={`TPM ${formatNumber(stats?.tpm)}`}
               />
             </View>
             <Section
               title="账号概览"
-              subtitle="总数、健康、异常和限流状态一览"
+              subtitle="全部账号的总数、健康与异常数量"
               right={(
                 <Pressable
                   style={{ alignSelf: 'flex-start', backgroundColor: colors.border, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8 }}
-                  onPress={() => router.push('/accounts/overview')}
+                  onPress={() => router.push('/accounts')}
                 >
                   <Text style={{ color: '#4e463e', fontSize: 12, fontWeight: '700' }}>账号清单</Text>
                 </Pressable>
               )}
             >
-              <Pressable onPress={() => router.push('/accounts/overview')}>
+              <Pressable onPress={() => router.push('/accounts')}>
                 <View style={{ flexDirection: 'row', gap: 8 }}>
                   <View style={{ flex: 1, backgroundColor: colors.mutedCard, borderRadius: 14, padding: 12 }}>
                     <Text style={{ fontSize: 11, color: '#8a8072' }}>总数</Text>
@@ -351,14 +376,12 @@ export default function MonitorScreen() {
                     <Text style={{ fontSize: 11, color: colors.danger }}>异常</Text>
                     <Text style={{ marginTop: 6, fontSize: 18, fontWeight: '700', color: colors.danger }}>{formatNumber(errorAccounts)}</Text>
                   </View>
-                  <View style={{ flex: 1, backgroundColor: colors.mutedCard, borderRadius: 14, padding: 12 }}>
-                    <Text style={{ fontSize: 11, color: '#8a8072' }}>限流</Text>
-                    <Text style={{ marginTop: 6, fontSize: 18, fontWeight: '700', color: colors.text }}>{formatNumber(currentPageLimitedAccounts)}</Text>
-                  </View>
                 </View>
-                <Text style={{ marginTop: 10, fontSize: 12, color: colors.subtext }}>总数 / 健康 / 异常优先使用后端聚合字段；限流与繁忙基于当前页账号列表。点击进入账号清单。</Text>
+                <Text style={{ marginTop: 10, fontSize: 12, color: colors.subtext }}>进入账号清单查看每个账号的用量和限额。</Text>
               </Pressable>
             </Section>
+
+            <QueryNotice label="用量趋势" error={trendQuery.error} loading={trendQuery.isPending} retry={() => void trendQuery.refetch()} />
 
             {throughputPoints.length > 1 ? (
               <LineTrendChart title="Token 吞吐" subtitle="当前时间范围内的 Token 变化趋势" points={throughputPoints} color="#a34d2d" formatValue={formatTokenDisplay} />
@@ -372,7 +395,7 @@ export default function MonitorScreen() {
               <LineTrendChart title="成本趋势" subtitle="当前时间范围内的成本变化趋势" points={costPoints} color="#7651c8" formatValue={formatMoney} />
             ) : null}
 
-            <BarChartCard
+            {trendQuery.data ? <BarChartCard
               title="Token 结构"
               subtitle="输入、输出、缓存读取占比"
               items={[
@@ -381,22 +404,25 @@ export default function MonitorScreen() {
                 { label: '缓存读取 Token', value: totalCacheReadTokens, color: '#7d7468', hint: '命中缓存后复用的 token。' },
               ]}
               formatValue={formatTokenDisplay}
-            />
+            /> : null}
 
-            <DonutChartCard
-              title="账号健康"
-              subtitle="健康、繁忙、限流、异常分布"
-              centerLabel="总账号"
-              centerValue={formatNumber(totalAccounts)}
+            <QueryNotice label="账号状态" error={accountsQuery.error} loading={accountsQuery.isPending} retry={() => void accountsQuery.refetch()} />
+            {accountsQuery.data ? <DonutChartCard
+              title="已查询账号状态"
+              subtitle={`以下仅覆盖已查询的 ${accounts.length} 个账号，共 ${formatNumber(totalAccounts)} 个；其余账号请到清单查询。`}
+              centerLabel="已查询账号"
+              centerValue={String(accounts.length)}
               segments={[
-                { label: '健康', value: healthyAccounts, color: '#1d5f55' },
-                { label: '繁忙', value: currentPageBusyAccounts, color: '#d38b36' },
-                { label: '限流', value: currentPageLimitedAccounts, color: '#7d7468' },
-                { label: '异常', value: errorAccounts, color: '#a34d2d' },
+                { label: '正常', value: sampleStatus.healthy, color: '#1d5f55' },
+                { label: '繁忙', value: sampleStatus.busy, color: '#d38b36' },
+                { label: '限流', value: sampleStatus.limited, color: '#7d7468' },
+                { label: '暂停', value: sampleStatus.paused, color: '#b6a78f' },
+                { label: '异常', value: sampleStatus.error, color: '#a34d2d' },
               ]}
-            />
+            /> : null}
 
-            <BarChartCard
+            <QueryNotice label="模型统计" error={modelsQuery.error} loading={modelsQuery.isPending} retry={() => void modelsQuery.refetch()} />
+            {modelsQuery.data ? <BarChartCard
               title="热点模型"
               subtitle="当前时间范围内最活跃的模型"
               items={topModels.map((model) => ({
@@ -406,9 +432,9 @@ export default function MonitorScreen() {
                 meta: `请求 ${formatNumber(model.requests)} · 成本 ${formatMoney(model.cost)}`,
               }))}
               formatValue={formatCompactNumber}
-            />
+            /> : null}
 
-            <Section title="趋势摘要" subtitle="最近几个统计点的请求、Token 和成本变化">
+            {trendQuery.data ? <Section title="趋势摘要" subtitle="最近几个统计点的请求、Token 和成本变化">
               {latestTrendPoints.length === 0 ? (
                 <Text style={{ fontSize: 14, color: colors.subtext }}>当前时间范围没有趋势数据。</Text>
               ) : (
@@ -436,7 +462,7 @@ export default function MonitorScreen() {
                   </View>
                 </View>
               )}
-            </Section>
+            </Section> : null}
 
           </View>
         )}

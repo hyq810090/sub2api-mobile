@@ -3,11 +3,13 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { Controller, useForm } from 'react-hook-form';
 import { Pressable, RefreshControl, ScrollView, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { z } from 'zod';
 
 import { getAdminSettings, getDashboardStats } from '@/src/services/admin';
 import { queryClient } from '@/src/lib/query-client';
+import { verifyAdminConnection } from '@/src/lib/admin-fetch';
+import { confirmAction, getManagementError } from '@/src/lib/management';
 import { adminConfigState, removeAdminAccount, saveAdminConfig, switchAdminAccount, type AdminAccountProfile } from '@/src/store/admin-config';
 
 const { useSnapshot } = require('valtio/react');
@@ -59,16 +61,19 @@ function getConnectionErrorMessage(error: unknown) {
 function ServerCard({
   account,
   active,
+  disabled,
   onSelect,
   onDelete,
 }: {
   account: AdminAccountProfile;
   active: boolean;
+  disabled: boolean;
   onSelect: () => Promise<void>;
   onDelete: () => Promise<void>;
 }) {
   return (
     <Pressable
+      disabled={disabled}
       onPress={onSelect}
       style={{
         backgroundColor: active ? '#e6f4ee' : colors.card,
@@ -92,10 +97,10 @@ function ServerCard({
       </View>
 
       <View style={{ flexDirection: 'row', gap: 10, marginTop: 14 }}>
-        <Pressable onPress={onSelect} style={{ flex: 1, backgroundColor: active ? '#d7eee4' : colors.primary, borderRadius: 14, paddingVertical: 11, alignItems: 'center' }}>
+        <Pressable disabled={disabled} onPress={onSelect} style={{ flex: 1, backgroundColor: active ? '#d7eee4' : colors.primary, borderRadius: 14, paddingVertical: 11, alignItems: 'center' }}>
           <Text style={{ color: active ? colors.success : '#fff', fontSize: 13, fontWeight: '700' }}>{active ? '已选中' : '切换到此服务器'}</Text>
         </Pressable>
-        <Pressable onPress={onDelete} style={{ backgroundColor: colors.border, borderRadius: 14, paddingHorizontal: 16, justifyContent: 'center' }}>
+        <Pressable disabled={disabled} onPress={onDelete} style={{ backgroundColor: colors.border, borderRadius: 14, paddingHorizontal: 16, justifyContent: 'center' }}>
           <Text style={{ color: '#7a3d31', fontSize: 13, fontWeight: '700' }}>删除</Text>
         </Pressable>
       </View>
@@ -110,6 +115,9 @@ export default function SettingsScreen() {
   const [connectionMessage, setConnectionMessage] = useState('');
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [showAdminKey, setShowAdminKey] = useState(false);
+  const operationLocked = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const { control, handleSubmit, formState, reset } = useForm<FormValues>({
     resolver: zodResolver(schema),
     defaultValues: {
@@ -118,38 +126,49 @@ export default function SettingsScreen() {
     },
   });
 
-  async function verifyAndEnter(successMessage: string) {
+  async function handleAdd(values: FormValues) {
+    if (operationLocked.current) return;
+    operationLocked.current = true;
+    const revision = adminConfigState.sessionRevision;
     setConnectionState('checking');
-    setConnectionMessage('正在检测当前服务是否可用...');
-
     try {
-      queryClient.clear();
-      await queryClient.fetchQuery({ queryKey: ['admin-settings'], queryFn: getAdminSettings });
-      await queryClient.prefetchQuery({ queryKey: ['monitor-stats'], queryFn: getDashboardStats });
-      setConnectionState('success');
-      setConnectionMessage(successMessage);
+      await verifyAdminConnection(values);
+      if (!mounted.current || revision !== adminConfigState.sessionRevision) return;
+      await saveAdminConfig(values);
       router.replace('/monitor');
     } catch (error) {
+      if (!mounted.current) return;
       setConnectionState('error');
-      setConnectionMessage(getConnectionErrorMessage(error));
-    }
-  }
-
-  async function handleAdd(values: FormValues) {
-    await saveAdminConfig(values);
-    reset({ baseUrl: '', adminApiKey: '' });
-    setShowForm(false);
-    await verifyAndEnter('服务器已添加并切换成功。');
+      setConnectionMessage(getManagementError(error));
+    } finally { operationLocked.current = false; }
   }
 
   async function handleSelect(account: AdminAccountProfile) {
-    await switchAdminAccount(account.id);
-    await verifyAndEnter(`已切换到 ${account.label}。`);
+    if (operationLocked.current || account.id === adminConfigState.activeAccountId) return;
+    operationLocked.current = true;
+    const revision = adminConfigState.sessionRevision;
+    setConnectionState('checking');
+    try {
+      await verifyAdminConnection(account);
+      if (!mounted.current || revision !== adminConfigState.sessionRevision) return;
+      await switchAdminAccount(account.id);
+      router.replace('/monitor');
+    } catch (error) {
+      if (!mounted.current) return;
+      setConnectionState('error');
+      setConnectionMessage(getManagementError(error));
+    } finally { operationLocked.current = false; }
   }
 
   async function handleDelete(account: AdminAccountProfile) {
-    await removeAdminAccount(account.id);
-    queryClient.clear();
+    if (operationLocked.current) return;
+    operationLocked.current = true;
+    const revision = adminConfigState.sessionRevision;
+    try {
+      if (!await confirmAction({ title: '移除服务器', message: `从手机移除 ${account.label} 的连接信息？不会删除后台数据。`, destructive: true })) return;
+      if (!mounted.current || revision !== adminConfigState.sessionRevision) return;
+      await removeAdminAccount(account.id);
+    } finally { operationLocked.current = false; }
   }
 
   async function handleRefresh() {
@@ -299,6 +318,7 @@ export default function SettingsScreen() {
               key={account.id}
               account={account}
               active={account.id === config.activeAccountId}
+              disabled={connectionState === 'checking'}
               onSelect={() => handleSelect(account)}
               onDelete={() => handleDelete(account)}
             />

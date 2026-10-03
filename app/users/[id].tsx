@@ -1,12 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import * as Clipboard from 'expo-clipboard';
 import { Stack, useLocalSearchParams } from 'expo-router';
-import { useMemo, useState } from 'react';
-import { Alert, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Pressable, RefreshControl, ScrollView, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { LineTrendChart } from '@/src/components/line-trend-chart';
+import { UserSubscriptions } from '@/src/components/user-subscriptions';
+import { confirmAction, createOperationKey, formatDateTime as formatTime, formatMoney, getManagementError as getErrorMessage } from '@/src/lib/management';
 import { getDashboardSnapshot, getUsageStats, getUser, listUserApiKeys, updateUserBalance, updateUserStatus } from '@/src/services/admin';
+import { adminConfigState } from '@/src/store/admin-config';
 import type { AdminApiKey, BalanceOperation } from '@/src/types/admin';
 
 const colors = {
@@ -22,61 +25,45 @@ const colors = {
   muted: '#f7f1e6',
 };
 
-type RangeKey = '24h' | '7d' | '30d';
+type RangeKey = 'today' | '7d' | '30d';
 
 const RANGE_OPTIONS: Array<{ key: RangeKey; label: string }> = [
-  { key: '24h', label: '24H' },
+  { key: 'today', label: '今日' },
   { key: '7d', label: '7D' },
   { key: '30d', label: '30D' },
 ];
+type BalancePayload = { amount: number; notes?: string; operation: BalanceOperation };
+const pendingBalanceOperations = new Map<string, { signature: string; key: string; payload: BalancePayload; needsVerification: boolean }>();
 
 function getDateRange(rangeKey: RangeKey) {
   const end = new Date();
   const start = new Date();
 
-  if (rangeKey === '24h') {
-    start.setHours(end.getHours() - 23, 0, 0, 0);
+  if (rangeKey === 'today') {
+    start.setHours(0, 0, 0, 0);
   } else if (rangeKey === '30d') {
     start.setDate(end.getDate() - 29);
   } else {
     start.setDate(end.getDate() - 6);
   }
 
-  const toDate = (value: Date) => value.toISOString().slice(0, 10);
+  const toDate = (value: Date) => `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
 
   return {
     start_date: toDate(start),
     end_date: toDate(end),
-    granularity: rangeKey === '24h' ? ('hour' as const) : ('day' as const),
+    granularity: rangeKey === 'today' ? ('hour' as const) : ('day' as const),
   };
 }
 
-function getErrorMessage(error: unknown) {
-  if (error instanceof Error && error.message) {
-    switch (error.message) {
-      case 'BASE_URL_REQUIRED':
-        return '请先到服务器页填写服务地址。';
-      case 'ADMIN_API_KEY_REQUIRED':
-        return '请先到服务器页填写 Admin Token。';
-      default:
-        return error.message;
-    }
-  }
-
-  return '加载失败，请稍后重试。';
-}
-
-function formatMoney(value?: number | null) {
-  return `$${Number(value ?? 0).toFixed(2)}`;
-}
-
 function formatUsageCost(stats?: { total_account_cost?: number | null; total_actual_cost?: number | null; total_cost?: number | null }) {
-  const value = Number(stats?.total_account_cost ?? stats?.total_actual_cost ?? stats?.total_cost ?? 0);
-  return `$${value.toFixed(4)}`;
+  const value = stats?.total_account_cost ?? stats?.total_actual_cost ?? stats?.total_cost;
+  return typeof value === 'number' && Number.isFinite(value) ? `$${value.toFixed(4)}` : '—';
 }
 
 function formatTokenValue(value?: number | null) {
-  const number = Number(value ?? 0);
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
+  const number = value;
   if (number >= 1_000_000_000) return `${(number / 1_000_000_000).toFixed(2)}B`;
   if (number >= 1_000_000) return `${(number / 1_000_000).toFixed(2)}M`;
   if (number >= 1_000) return `${(number / 1_000).toFixed(2)}K`;
@@ -84,30 +71,8 @@ function formatTokenValue(value?: number | null) {
 }
 
 
-function formatQuotaUsage(quotaUsed?: number | null, quota?: number | null) {
-  const used = Number(quotaUsed ?? 0);
-  const limit = Number(quota ?? 0);
-
-  if (limit <= 0) {
-    return '∞';
-  }
-
-  return `${used}`;
-}
-
-function formatTime(value?: string | null) {
-  if (!value) return '--';
-
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-
-  const year = date.getFullYear();
-  const month = `${date.getMonth() + 1}`.padStart(2, '0');
-  const day = `${date.getDate()}`.padStart(2, '0');
-  const hours = `${date.getHours()}`.padStart(2, '0');
-  const minutes = `${date.getMinutes()}`.padStart(2, '0');
-
-  return `${year}-${month}-${day} ${hours}:${minutes}`;
+function formatQuotaMoney(value?: number | null) {
+  return typeof value === 'number' && Number.isFinite(value) ? `$${value.toFixed(4)}` : '—';
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -196,6 +161,15 @@ function CopyInlineButton({ copied, onPress }: { copied: boolean; onPress: () =>
 }
 
 function KeyItem({ item, copied, onCopy }: { item: AdminApiKey; copied: boolean; onCopy: () => void }) {
+  const [revealed, setRevealed] = useState(false);
+  const limited = typeof item.quota === 'number' && item.quota > 0;
+  const quotaKnown = typeof item.quota === 'number' && Number.isFinite(item.quota);
+  const usedKnown = typeof item.quota_used === 'number' && Number.isFinite(item.quota_used);
+  const windows = [
+    { label: '5 小时', used: item.usage_5h, limit: item.rate_limit_5h },
+    { label: '1 天', used: item.usage_1d, limit: item.rate_limit_1d },
+    { label: '7 天', used: item.usage_7d, limit: item.rate_limit_7d },
+  ].filter((window) => window.used !== undefined || window.limit !== undefined);
   return (
     <View
       style={{
@@ -211,24 +185,43 @@ function KeyItem({ item, copied, onCopy }: { item: AdminApiKey; copied: boolean;
         <View style={{ flex: 1 }}>
           <View style={{ flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap' }}>
             <Text style={{ fontSize: 15, fontWeight: '700', color: colors.text }}>{item.name || `Key #${item.id}`}</Text>
-            <CopyInlineButton copied={copied} onPress={onCopy} />
+            {item.key ? <CopyInlineButton copied={copied} onPress={onCopy} /> : null}
           </View>
           <Text style={{ marginTop: 4, fontSize: 12, color: colors.subtext }}>{item.group?.name || '未分组'}</Text>
         </View>
         <StatusBadge text={item.status || '--'} />
       </View>
 
-      <Text style={{ marginTop: 10, fontSize: 12, lineHeight: 18, color: colors.text }}>{item.key || '--'}</Text>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 10 }}>
+        <Text selectable={revealed} style={{ flex: 1, fontSize: 12, lineHeight: 18, color: colors.text }}>{item.key ? (revealed ? item.key : '••••••••••••••••') : '服务器未返回密钥'}</Text>
+        {item.key ? <Pressable accessibilityRole="button" onPress={() => setRevealed((current) => !current)} style={{ padding: 8 }}>
+          <Text style={{ color: colors.primary, fontWeight: '700', fontSize: 12 }}>{revealed ? '隐藏' : '显示'}</Text>
+        </Pressable> : null}
+      </View>
 
       <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginTop: 12 }}>
         <View style={{ flex: 1 }}>
           <Text style={{ fontSize: 11, color: colors.subtext }}>已用额度</Text>
-          <Text style={{ marginTop: 4, fontSize: 16, fontWeight: '700', color: colors.text }}>{formatQuotaUsage(item.quota_used, item.quota)}</Text>
+          <Text style={{ marginTop: 4, fontSize: 14, fontWeight: '700', color: colors.text }}>{formatQuotaMoney(item.quota_used)}</Text>
         </View>
-        <View style={{ flex: 1, alignItems: 'flex-end' }}>
-          <Text style={{ fontSize: 11, color: colors.subtext }}>最后使用时间</Text>
-          <Text style={{ marginTop: 4, fontSize: 13, color: colors.subtext }}>{formatTime(item.last_used_at || item.updated_at || item.created_at)}</Text>
+        <View style={{ flex: 1 }}>
+          <Text style={{ fontSize: 11, color: colors.subtext }}>总限额</Text>
+          <Text style={{ marginTop: 4, fontSize: 14, fontWeight: '700', color: colors.text }}>{quotaKnown ? (limited ? formatQuotaMoney(item.quota) : '不限额') : '—'}</Text>
         </View>
+        <View style={{ flex: 1 }}>
+          <Text style={{ fontSize: 11, color: colors.subtext }}>剩余额度</Text>
+          <Text style={{ marginTop: 4, fontSize: 14, fontWeight: '700', color: colors.primary }}>{!quotaKnown ? '—' : !limited ? '不限额' : usedKnown ? formatQuotaMoney(Math.max(0, item.quota - item.quota_used)) : '—'}</Text>
+        </View>
+      </View>
+      {windows.length ? <View style={{ marginTop: 10, gap: 6 }}>
+        {windows.map((window) => <Text key={window.label} style={{ fontSize: 12, lineHeight: 18, color: colors.subtext }}>
+          {window.label}：已用 {formatQuotaMoney(window.used)} · 限额 {window.limit === undefined ? '—' : typeof window.limit === 'number' && window.limit > 0 ? formatQuotaMoney(window.limit) : '不限额'}
+          {typeof window.limit === 'number' && window.limit > 0 && typeof window.used === 'number' ? ` · 剩余 ${formatQuotaMoney(Math.max(0, window.limit - window.used))}` : ''}
+        </Text>)}
+      </View> : null}
+      <View style={{ marginTop: 12, gap: 5 }}>
+        <Text style={{ fontSize: 12, color: colors.subtext }}>到期时间：{item.expires_at === undefined ? '未返回' : item.expires_at ? formatTime(item.expires_at) : '永不过期'}</Text>
+        <Text style={{ fontSize: 12, color: colors.subtext }}>最后使用：{formatTime(item.last_used_at)}</Text>
       </View>
     </View>
   );
@@ -237,34 +230,55 @@ function KeyItem({ item, copied, onCopy }: { item: AdminApiKey; copied: boolean;
 export default function UserDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const userId = Number(id);
+  const validUserId = Number.isSafeInteger(userId) && userId > 0;
   const queryClient = useQueryClient();
+  const balanceScope = `${adminConfigState.activeAccountId}:${adminConfigState.baseUrl}:${userId}`;
+  const savedBalanceOperation = pendingBalanceOperations.get(balanceScope);
 
-  const [operation, setOperation] = useState<BalanceOperation>('add');
-  const [amount, setAmount] = useState('10');
-  const [notes, setNotes] = useState('');
+  const [operation, setOperation] = useState<BalanceOperation>(savedBalanceOperation?.payload.operation ?? 'add');
+  const [amount, setAmount] = useState(savedBalanceOperation ? String(savedBalanceOperation.payload.amount) : '10');
+  const [notes, setNotes] = useState(savedBalanceOperation?.payload.notes ?? '');
   const [formError, setFormError] = useState<string | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [balanceSuccess, setBalanceSuccess] = useState<string | null>(null);
+  const [statusSuccess, setStatusSuccess] = useState<string | null>(null);
+  const [balanceConfirming, setBalanceConfirming] = useState(false);
+  const [statusConfirming, setStatusConfirming] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [balanceUncertain, setBalanceUncertain] = useState(savedBalanceOperation?.needsVerification ?? false);
+  const [verifyingBalance, setVerifyingBalance] = useState(false);
+  const [apiKeysPage, setApiKeysPage] = useState(1);
   const [searchText, setSearchText] = useState('');
   const [copiedKeyId, setCopiedKeyId] = useState<number | null>(null);
   const [rangeKey, setRangeKey] = useState<RangeKey>('7d');
+  const balanceOperation = useRef<{ signature: string; key: string } | null>(savedBalanceOperation ?? null);
+  const balanceActionLock = useRef(false);
+  const statusActionLock = useRef(false);
+  const mounted = useRef(true);
+  const currentIdentity = useRef(balanceScope);
+  currentIdentity.current = balanceScope;
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   const range = getDateRange(rangeKey);
 
   const userQuery = useQuery({
     queryKey: ['user', userId],
     queryFn: () => getUser(userId),
-    enabled: Number.isFinite(userId),
+    enabled: validUserId,
   });
 
   const apiKeysQuery = useQuery({
-    queryKey: ['user-api-keys', userId],
-    queryFn: () => listUserApiKeys(userId),
-    enabled: Number.isFinite(userId),
+    queryKey: ['user-api-keys', userId, apiKeysPage],
+    queryFn: () => listUserApiKeys(userId, apiKeysPage, 20),
+    enabled: validUserId,
   });
 
   const usageStatsQuery = useQuery({
     queryKey: ['usage-stats', 'user', userId, rangeKey, range.start_date, range.end_date],
     queryFn: () => getUsageStats({ ...range, user_id: userId }),
-    enabled: Number.isFinite(userId),
+    enabled: validUserId,
   });
 
   const usageSnapshotQuery = useQuery({
@@ -279,40 +293,46 @@ export default function UserDetailScreen() {
         include_group_stats: false,
         include_users_trend: false,
       }),
-    enabled: Number.isFinite(userId),
+    enabled: validUserId,
   });
-;
-;
 
   const balanceMutation = useMutation({
-    mutationFn: (payload: { amount: number; notes?: string; operation: BalanceOperation }) =>
+    retry: false,
+    mutationFn: (payload: { amount: number; notes?: string; operation: BalanceOperation; operationKey: string }) =>
       updateUserBalance(userId, {
         balance: payload.amount,
         notes: payload.notes,
         operation: payload.operation,
-      }),
-    onSuccess: () => {
+      }, payload.operationKey),
+    onMutate: () => { setFormError(null); setBalanceSuccess(null); },
+    onSuccess: async () => {
       setFormError(null);
+      setBalanceSuccess('余额操作已完成。');
+      balanceOperation.current = null;
+      pendingBalanceOperations.delete(balanceScope);
       setAmount('10');
       setNotes('');
-      queryClient.invalidateQueries({ queryKey: ['user', userId] });
-      queryClient.invalidateQueries({ queryKey: ['users'] });
+      await Promise.all([queryClient.invalidateQueries({ queryKey: ['user', userId] }), queryClient.invalidateQueries({ queryKey: ['users'] })]);
     },
-    onError: (error) => setFormError(getErrorMessage(error)),
+    onError: (error) => { setFormError(getErrorMessage(error)); setBalanceUncertain(true); },
+    onSettled: () => { balanceActionLock.current = false; },
   });
 
   const statusMutation = useMutation({
+    retry: false,
     mutationFn: (status: 'active' | 'disabled') => updateUserStatus(userId, status),
-    onSuccess: () => {
+    onSuccess: async () => {
       setStatusError(null);
-      queryClient.invalidateQueries({ queryKey: ['user', userId] });
-      queryClient.invalidateQueries({ queryKey: ['users'] });
+      setStatusSuccess('用户状态已更新。');
+      await Promise.all([queryClient.invalidateQueries({ queryKey: ['user', userId] }), queryClient.invalidateQueries({ queryKey: ['users'] })]);
     },
     onError: (error) => setStatusError(getErrorMessage(error)),
+    onSettled: () => { statusActionLock.current = false; },
   });
 
   const user = userQuery.data;
   const apiKeys = apiKeysQuery.data?.items ?? [];
+  const apiKeyPages = apiKeysQuery.data?.pages || Math.ceil((apiKeysQuery.data?.total || 0) / 20);
 
   const filteredApiKeys = useMemo(() => {
     const keyword = searchText.trim().toLowerCase();
@@ -323,11 +343,12 @@ export default function UserDetailScreen() {
     });
   }, [apiKeys, searchText]);
   const trendPoints = (usageSnapshotQuery.data?.trend ?? []).map((item) => ({
-    label: rangeKey === '24h' ? item.date.slice(11, 13) : item.date.slice(5, 10),
+    label: rangeKey === 'today' ? item.date.slice(11, 13) : item.date.slice(5, 10),
     value: item.total_tokens,
   }));
 
-  function submitBalance() {
+  async function submitBalance() {
+    if (!validUserId || balanceActionLock.current || balanceUncertain || balanceMutation.isPending || balanceConfirming || !user) return;
     const numericAmount = Number(amount);
 
     if (!amount.trim()) {
@@ -335,49 +356,104 @@ export default function UserDetailScreen() {
       return;
     }
 
-    if (!Number.isFinite(numericAmount) || numericAmount < 0) {
-      setFormError('金额格式不正确。');
+    if (!/^\d+(\.\d{1,6})?$/.test(amount.trim()) || !Number.isFinite(numericAmount) || numericAmount < 0 || (operation !== 'set' && numericAmount === 0)) {
+      setFormError('请输入有效金额（最多 6 位小数）；充值或扣减须大于 0。');
       return;
     }
-
-    balanceMutation.mutate({
+    const payload = {
       amount: numericAmount,
       notes: notes.trim() || undefined,
       operation,
+    };
+    const action = operation === 'set' ? '设置余额' : operation === 'subtract' ? '扣减余额' : '充值余额';
+    const sessionRevision = adminConfigState.sessionRevision;
+    balanceActionLock.current = true;
+    setBalanceConfirming(true);
+    const confirmed = await confirmAction({
+      title: action,
+      message: `${balanceOperation.current?.signature === JSON.stringify(payload) ? '重试原请求，沿用原请求编号，避免重复变更余额。' : '这是一次新的余额操作。'}${user.email}（#${userId}）当前余额 ${formatMoney(user.balance)}。${operation === 'set' ? '将余额设为' : operation === 'subtract' ? '将扣减' : '将增加'} ${formatQuotaMoney(numericAmount)}。确认执行？`,
+      destructive: operation === 'subtract' || operation === 'set',
     });
+    setBalanceConfirming(false);
+    if (!confirmed || !mounted.current || currentIdentity.current !== balanceScope || adminConfigState.sessionRevision !== sessionRevision) { balanceActionLock.current = false; return; }
+    const signature = JSON.stringify(payload);
+    if (balanceOperation.current?.signature !== signature) balanceOperation.current = { signature, key: createOperationKey(`user-balance-${userId}`) };
+    pendingBalanceOperations.set(balanceScope, { ...balanceOperation.current, payload, needsVerification: true });
+    balanceMutation.mutate({ ...payload, operationKey: balanceOperation.current.key });
   }
 
   async function copyKey(item: AdminApiKey) {
-    await Clipboard.setStringAsync(item.key || '');
-    setCopiedKeyId(item.id);
-    setTimeout(() => {
-      setCopiedKeyId((current) => (current === item.id ? null : current));
-    }, 1500);
+    if (!item.key) return;
+    try {
+      await Clipboard.setStringAsync(item.key);
+      setCopiedKeyId(item.id);
+      setTimeout(() => {
+        setCopiedKeyId((current) => (current === item.id ? null : current));
+      }, 1500);
+    } catch {
+      setStatusError('复制失败，请显示密钥后手动复制。');
+    }
   }
 
-  function handleToggleUserStatus() {
-    if (!user) return;
+  async function handleToggleUserStatus() {
+    if (!user || !validUserId || statusActionLock.current || statusMutation.isPending || statusConfirming || user.role?.toLowerCase() === 'admin') return;
     const nextStatus: 'active' | 'disabled' = user.status === 'disabled' ? 'active' : 'disabled';
     const actionLabel = nextStatus === 'disabled' ? '禁用' : '启用';
-
-    Alert.alert(`${actionLabel}用户`, `确认要${actionLabel}该用户吗？`, [
-      { text: '取消', style: 'cancel' },
-      {
-        text: '确认',
-        style: nextStatus === 'disabled' ? 'destructive' : 'default',
-        onPress: () => {
-          setStatusError(null);
-          statusMutation.mutate(nextStatus);
-        },
-      },
-    ]);
+    const sessionRevision = adminConfigState.sessionRevision;
+    statusActionLock.current = true;
+    setStatusConfirming(true);
+    const confirmed = await confirmAction({
+      title: `${actionLabel}用户`,
+      message: `确认${actionLabel} ${user.email}（#${userId}）？${nextStatus === 'disabled' ? '禁用后该用户无法继续使用服务。' : ''}`,
+      destructive: nextStatus === 'disabled',
+    });
+    setStatusConfirming(false);
+    if (confirmed && mounted.current && currentIdentity.current === balanceScope && adminConfigState.sessionRevision === sessionRevision) { setStatusError(null); setStatusSuccess(null); statusMutation.mutate(nextStatus); }
+    else statusActionLock.current = false;
   }
+
+  async function verifyBalanceResult() {
+    if (balanceActionLock.current || verifyingBalance || !validUserId) return;
+    balanceActionLock.current = true;
+    setVerifyingBalance(true);
+    const sessionRevision = adminConfigState.sessionRevision;
+    try {
+      const freshUser = await getUser(userId);
+      if (adminConfigState.sessionRevision !== sessionRevision) return;
+      queryClient.setQueryData(['user', userId], freshUser);
+      setBalanceUncertain(false);
+      const pending = pendingBalanceOperations.get(balanceScope);
+      if (pending) pendingBalanceOperations.set(balanceScope, { ...pending, needsVerification: false });
+      setFormError(null);
+      setBalanceSuccess(`已查询当前余额：${formatMoney(freshUser.balance)}。相同金额、备注和操作的重试将沿用原请求，避免重复扣款或充值。`);
+    } catch (error) { setFormError(`余额查询失败：${getErrorMessage(error)}`); }
+    finally { balanceActionLock.current = false; setVerifyingBalance(false); }
+  }
+
+  async function refreshAll() {
+    setRefreshing(true);
+    try {
+      await Promise.all([
+        userQuery.refetch(), apiKeysQuery.refetch(), usageStatsQuery.refetch(), usageSnapshotQuery.refetch(),
+        queryClient.invalidateQueries({ queryKey: ['user-subscriptions', userId] }),
+        queryClient.invalidateQueries({ queryKey: ['subscription-progress'] }),
+      ]);
+    } finally { setRefreshing(false); }
+  }
+
+  if (!validUserId) return <>
+    <Stack.Screen options={{ title: '用户详情' }} />
+    <SafeAreaView style={{ flex: 1, backgroundColor: colors.page, padding: 16 }}>
+      <Section title="无法查询"><Text style={{ color: colors.errorText }}>用户编号无效，请返回用户列表重新选择。</Text></Section>
+    </SafeAreaView>
+  </>;
 
   return (
     <>
       <Stack.Screen options={{ title: user?.email || '用户详情' }} />
       <SafeAreaView edges={['bottom']} style={{ flex: 1, backgroundColor: colors.page }}>
-        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, paddingBottom: 40 }}>
+        <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, paddingBottom: 40 }}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { void refreshAll(); }} tintColor={colors.primary} />}>
           {userQuery.isLoading ? (
             <Section title="状态">
               <Text style={{ color: colors.subtext }}>正在加载用户详情...</Text>
@@ -389,6 +465,7 @@ export default function UserDetailScreen() {
               <View style={{ backgroundColor: colors.errorBg, borderRadius: 12, padding: 12 }}>
                 <Text style={{ color: colors.errorText, fontWeight: '700' }}>用户信息加载失败</Text>
                 <Text style={{ marginTop: 6, color: colors.errorText }}>{getErrorMessage(userQuery.error)}</Text>
+                <Pressable onPress={() => { void userQuery.refetch(); }} disabled={userQuery.isFetching} style={{ paddingVertical: 10 }}><Text style={{ color: colors.primary, fontWeight: '700' }}>重新查询</Text></Pressable>
               </View>
             </Section>
           ) : null}
@@ -418,7 +495,7 @@ export default function UserDetailScreen() {
                   }}
                 >
                   <Text style={{ fontSize: 11, color: colors.subtext }}>最后使用时间</Text>
-                  <Text style={{ marginTop: 4, fontSize: 13, color: colors.subtext }}>{formatTime(user.last_used_at || user.updated_at || user.created_at)}</Text>
+                  <Text style={{ marginTop: 4, fontSize: 13, color: colors.subtext }}>{formatTime(user.last_used_at)}</Text>
                 </View>
               </View>
 
@@ -428,14 +505,14 @@ export default function UserDetailScreen() {
                   <StatusBadge text={user.status || 'active'} />
                 </View>
                 <Pressable
-                  disabled={statusMutation.isPending || user.role?.toLowerCase() === 'admin'}
+                  disabled={statusMutation.isPending || statusConfirming || user.role?.toLowerCase() === 'admin'}
                   onPress={handleToggleUserStatus}
                   style={{
                     backgroundColor: user.status === 'disabled' ? colors.primary : '#8b3f1f',
                     borderRadius: 10,
                     paddingHorizontal: 12,
                     paddingVertical: 10,
-                    opacity: statusMutation.isPending || user.role?.toLowerCase() === 'admin' ? 0.6 : 1,
+                    opacity: statusMutation.isPending || statusConfirming || user.role?.toLowerCase() === 'admin' ? 0.6 : 1,
                   }}
                 >
                   <Text style={{ color: '#fff', fontSize: 12, fontWeight: '700' }}>
@@ -451,8 +528,11 @@ export default function UserDetailScreen() {
                   <Text style={{ color: colors.errorText }}>{statusError}</Text>
                 </View>
               ) : null}
+              {statusSuccess ? <Text style={{ marginTop: 10, color: colors.primary }}>{statusSuccess}</Text> : null}
             </Section>
           ) : null}
+
+          <UserSubscriptions userId={userId} />
 
           <Section title="总用量">
             <View style={{ flexDirection: 'row', gap: 8, marginBottom: 12 }}>
@@ -521,11 +601,12 @@ export default function UserDetailScreen() {
             ) : null}
           </Section>
 
-          <Section title="API Keys">
+          <Section title="API Key 额度">
+            <Text style={{ color: colors.subtext, fontSize: 12, marginBottom: 10 }}>已用金额始终显示；总限额为 0 表示不限额。密钥默认隐藏。</Text>
             <TextInput
               value={searchText}
               onChangeText={setSearchText}
-              placeholder="搜索名称 / Key / 分组"
+              placeholder="搜索本页名称 / Key / 分组"
               placeholderTextColor="#9a9082"
               style={{
                 backgroundColor: colors.muted,
@@ -540,11 +621,13 @@ export default function UserDetailScreen() {
             />
 
             {apiKeysQuery.isLoading ? <Text style={{ color: colors.subtext }}>正在加载 API Keys...</Text> : null}
+            {apiKeysQuery.data ? <Text style={{ color: colors.subtext, fontSize: 12, marginBottom: 10 }}>共 {apiKeysQuery.data.total} 个 Key · 第 {apiKeysPage} 页</Text> : null}
 
             {apiKeysQuery.error ? (
               <View style={{ backgroundColor: colors.errorBg, borderRadius: 12, padding: 12 }}>
                 <Text style={{ color: colors.errorText, fontWeight: '700' }}>API Keys 加载失败</Text>
                 <Text style={{ marginTop: 6, color: colors.errorText }}>{getErrorMessage(apiKeysQuery.error)}</Text>
+                <Pressable onPress={() => { void apiKeysQuery.refetch(); }} disabled={apiKeysQuery.isFetching} style={{ paddingVertical: 10 }}><Text style={{ color: colors.primary, fontWeight: '700' }}>重新查询</Text></Pressable>
               </View>
             ) : null}
 
@@ -559,6 +642,11 @@ export default function UserDetailScreen() {
                 <Text style={{ color: colors.subtext }}>当前筛选条件下没有 Key。</Text>
               )
             ) : null}
+            {apiKeyPages > 1 ? <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginTop: 12 }}>
+              <Pressable disabled={apiKeysPage <= 1 || apiKeysQuery.isFetching} onPress={() => setApiKeysPage((current) => current - 1)} style={{ padding: 12, opacity: apiKeysPage <= 1 ? 0.5 : 1 }}><Text style={{ color: colors.primary, fontWeight: '700' }}>上一页</Text></Pressable>
+              <Text style={{ color: colors.subtext }}>{apiKeysPage} / {apiKeyPages}</Text>
+              <Pressable disabled={apiKeysPage >= apiKeyPages || apiKeysQuery.isFetching} onPress={() => setApiKeysPage((current) => current + 1)} style={{ padding: 12, opacity: apiKeysPage >= apiKeyPages ? 0.5 : 1 }}><Text style={{ color: colors.primary, fontWeight: '700' }}>下一页</Text></Pressable>
+            </View> : null}
           </Section>
 
           <Section title="余额操作">
@@ -572,6 +660,7 @@ export default function UserDetailScreen() {
                 return (
                   <Pressable
                     key={item.value}
+                    disabled={balanceMutation.isPending || balanceConfirming || balanceUncertain || verifyingBalance}
                     onPress={() => setOperation(item.value)}
                     style={{
                       flex: 1,
@@ -591,6 +680,7 @@ export default function UserDetailScreen() {
 
             <TextInput
               value={amount}
+              editable={!balanceMutation.isPending && !balanceConfirming && !balanceUncertain && !verifyingBalance}
               onChangeText={setAmount}
               placeholder="输入金额，例如 10"
               placeholderTextColor="#9a9082"
@@ -609,6 +699,7 @@ export default function UserDetailScreen() {
 
             <TextInput
               value={notes}
+              editable={!balanceMutation.isPending && !balanceConfirming && !balanceUncertain && !verifyingBalance}
               onChangeText={setNotes}
               placeholder="备注（可选）"
               placeholderTextColor="#9a9082"
@@ -629,8 +720,13 @@ export default function UserDetailScreen() {
                 <Text style={{ color: colors.errorText }}>{formError}</Text>
               </View>
             ) : null}
+            {balanceSuccess ? <Text style={{ color: colors.primary, marginBottom: 10 }}>{balanceSuccess}</Text> : null}
+            {balanceUncertain ? <View style={{ marginBottom: 12 }}>
+              <Text style={{ color: colors.subtext, fontSize: 12, lineHeight: 18, marginBottom: 8 }}>请先重新查询余额，核对上次操作结果后再继续。</Text>
+              <Pressable disabled={verifyingBalance} onPress={verifyBalanceResult} style={{ padding: 12, alignItems: 'center', borderWidth: 1, borderColor: colors.border, borderRadius: 10 }}><Text style={{ color: colors.primary, fontWeight: '700' }}>{verifyingBalance ? '查询余额中...' : '查询操作结果'}</Text></Pressable>
+            </View> : null}
 
-            <Pressable onPress={submitBalance} style={{ backgroundColor: colors.dark, borderRadius: 12, paddingVertical: 14, alignItems: 'center' }}>
+            <Pressable onPress={submitBalance} disabled={!user || balanceMutation.isPending || balanceConfirming || balanceUncertain || verifyingBalance} style={{ backgroundColor: colors.dark, borderRadius: 12, paddingVertical: 14, alignItems: 'center', opacity: !user || balanceMutation.isPending || balanceConfirming || balanceUncertain || verifyingBalance ? 0.6 : 1 }}>
               <Text style={{ color: '#fff', fontWeight: '700' }}>{balanceMutation.isPending ? '提交中...' : '确认提交'}</Text>
             </Pressable>
           </Section>

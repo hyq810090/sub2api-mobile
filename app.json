@@ -3,7 +3,7 @@
     "name": "sub2api-mobile",
     "slug": "sub2api-mobile",
     "owner": "ckken",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "orientation": "portrait",
     "icon": "./icons/ios/AppIcon.appiconset/icon-1024.png",
     "userInterfaceStyle": "light",
@@ -27,7 +27,8 @@
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./icons/android/playstore-icon.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "versionCode": 2
     },
     "web": {
       "favicon": "./icons/ios/AppIcon.appiconset/icon-1024.png"

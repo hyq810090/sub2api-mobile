@@ -8,13 +8,9 @@ import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 import { queryClient } from '@/src/lib/query-client';
 import { markPerformance } from '@/src/lib/performance';
-import { adminConfigState, hydrateAdminConfig } from '@/src/store/admin-config';
+import { adminConfigState, hasAuthenticatedAdminSession, hydrateAdminConfig } from '@/src/store/admin-config';
 
 const { useSnapshot } = require('valtio/react');
-
-export const unstable_settings = {
-  initialRouteName: '(tabs)',
-};
 
 export default function RootLayout() {
   const config = useSnapshot(adminConfigState);
@@ -34,9 +30,14 @@ export default function RootLayout() {
             <ActivityIndicator color="#1d5f55" />
           </View>
         ) : (
-          <Stack initialRouteName="(tabs)" screenOptions={{ headerShown: false }}>
-            <Stack.Screen name="(tabs)" />
+          <Stack key={config.sessionRevision} initialRouteName={hasAuthenticatedAdminSession(config) ? '(tabs)' : 'login'} screenOptions={{ headerShown: false }}>
             <Stack.Screen name="login" />
+            <Stack.Protected guard={hasAuthenticatedAdminSession(config)}>
+            <Stack.Screen name="(tabs)" />
+            <Stack.Screen name="accounts/[id]" options={{
+              animation: 'slide_from_right', headerShown: true, title: '账号详情', headerBackTitle: '返回',
+              headerTintColor: '#16181a', headerStyle: { backgroundColor: '#f4efe4' }, headerShadowVisible: false,
+            }} />
             <Stack.Screen
               name="users/[id]"
               options={{
@@ -102,6 +103,7 @@ export default function RootLayout() {
                 headerShadowVisible: false,
               }}
             />
+            </Stack.Protected>
           </Stack>
         )}
       </QueryClientProvider>

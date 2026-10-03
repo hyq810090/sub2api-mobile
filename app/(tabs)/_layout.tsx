@@ -1,5 +1,5 @@
 import { Redirect, Tabs } from 'expo-router';
-import { ChartNoAxesCombined, Settings2, Users } from 'lucide-react-native';
+import { ChartNoAxesCombined, KeyRound, Settings2, Users } from 'lucide-react-native';
 
 import { adminConfigState, hasAuthenticatedAdminSession } from '@/src/store/admin-config';
 
@@ -50,6 +50,13 @@ export default function TabsLayout() {
         }}
       />
       <Tabs.Screen
+        name="accounts"
+        options={{
+          title: '账号',
+          tabBarIcon: ({ color, size }) => <KeyRound color={color} size={size} />,
+        }}
+      />
+      <Tabs.Screen
         name="settings"
         options={{
           title: '服务器',
@@ -57,7 +64,6 @@ export default function TabsLayout() {
         }}
       />
       <Tabs.Screen name="groups" options={{ href: null }} />
-      <Tabs.Screen name="accounts" options={{ href: null }} />
     </Tabs>
   );
 }
