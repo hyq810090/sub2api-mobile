@@ -1,313 +1,120 @@
-import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
-import { KeyRound, Search, ShieldCheck, ShieldOff } from 'lucide-react-native';
-import { useCallback, useMemo, useState } from 'react';
-import { FlatList, Pressable, RefreshControl, Text, TextInput, View } from 'react-native';
+import { useQueries, useQuery } from '@tanstack/react-query';
+import { useRouter } from 'expo-router';
+import { ChevronRight, KeyRound, Search } from 'lucide-react-native';
+import { useEffect, useMemo, useState } from 'react';
+import { ActivityIndicator, FlatList, Pressable, RefreshControl, Text, TextInput, View } from 'react-native';
 import type { Edge } from 'react-native-safe-area-context';
 
 import { ListCard } from '@/src/components/list-card';
 import { ScreenShell } from '@/src/components/screen-shell';
 import { useDebouncedValue } from '@/src/hooks/use-debounced-value';
 import { formatTokenValue } from '@/src/lib/formatters';
-import { getAccountTodayStats, listAccounts, setAccountSchedulable, testAccount } from '@/src/services/admin';
+import { getAccountTodayStats, listAccounts } from '@/src/services/admin';
 import type { AdminAccount } from '@/src/types/admin';
 
 type AccountStatusFilter = 'all' | 'active' | 'paused' | 'error';
 type UsageSort = 'usage-desc' | 'usage-asc';
-type AccountVisualStatus = {
-  filterKey: AccountStatusFilter;
-  label: '正常' | '暂停' | '异常';
-  badgeTone: 'success' | 'muted' | 'danger';
-};
+type TodaySummary = { requests?: number; tokens?: number; cost?: number; failed: boolean };
 
-type AccountTodaySummary = {
-  requests: number;
-  tokens: number;
-  cost: number;
-};
-
-function formatTime(value?: string | null) {
-  if (!value) return '--';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '--';
-  return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
-}
-
-function getAccountError(account: AdminAccount) {
-  return Boolean(account.status === 'error' || account.error_message);
-}
-
-function getAccountVisualStatus(account: AdminAccount): AccountVisualStatus {
-  const normalizedStatus = `${account.status ?? ''}`.toLowerCase();
-  const isPausedStatus = ['inactive', 'disabled', 'paused', 'stop', 'stopped'].includes(normalizedStatus);
-
-  if (getAccountError(account)) {
-    return { filterKey: 'error', label: '异常', badgeTone: 'danger' };
+function timestamp(value: unknown) {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return value < 1e12 ? value * 1000 : value;
   }
-  if (isPausedStatus || account.schedulable === false) {
-    return { filterKey: 'paused', label: '暂停', badgeTone: 'muted' };
-  }
-  return { filterKey: 'active', label: '正常', badgeTone: 'success' };
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const numeric = /^\d{10,13}$/.test(value) ? Number(value) : undefined;
+  const parsed = numeric === undefined ? Date.parse(value) : numeric < 1e12 ? numeric * 1000 : numeric;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-type AccountsListScreenProps = {
-  safeAreaEdges?: Edge[];
-};
+function getVisualStatus(account: AdminAccount, now: number) {
+  const expiresAt = timestamp(account.expires_at);
+  if (expiresAt !== undefined && expiresAt <= now) {
+    return { key: 'error', label: '已过期', tone: 'danger' } as const;
+  }
+  if (account.status === 'error' || account.error_message) {
+    return { key: 'error', label: '异常', tone: 'danger' } as const;
+  }
+  if ((timestamp(account.temp_unschedulable_until) ?? 0) > now) {
+    return { key: 'error', label: '临时暂停', tone: 'danger' } as const;
+  }
+  if ((timestamp(account.rate_limit_reset_at) ?? 0) > now) {
+    return { key: 'error', label: '限流', tone: 'danger' } as const;
+  }
+  if ((timestamp(account.overload_until) ?? 0) > now) {
+    return { key: 'error', label: '过载冷却', tone: 'danger' } as const;
+  }
+  if (account.schedulable === false || ['inactive', 'disabled', 'paused', 'stop', 'stopped'].includes((account.status ?? '').toLowerCase())) {
+    return { key: 'paused', label: '暂停', tone: 'muted' } as const;
+  }
+  return { key: 'active', label: '正常', tone: 'success' } as const;
+}
 
-export function AccountsListScreen({ safeAreaEdges }: AccountsListScreenProps) {
+function knownNumber(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+export function AccountsListScreen({ safeAreaEdges }: { safeAreaEdges?: Edge[] }) {
+  const router = useRouter();
   const [searchText, setSearchText] = useState('');
+  const [page, setPage] = useState(1);
   const [filter, setFilter] = useState<AccountStatusFilter>('all');
   const [usageSort, setUsageSort] = useState<UsageSort>('usage-desc');
-  const [testingAccountId, setTestingAccountId] = useState<number | null>(null);
-  const [testFeedbackByAccountId, setTestFeedbackByAccountId] = useState<Record<number, string>>({});
-  const [togglingAccountId, setTogglingAccountId] = useState<number | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [statusTime, setStatusTime] = useState(Date.now);
+  useEffect(() => {
+    const timer = setInterval(() => setStatusTime(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, []);
   const keyword = useDebouncedValue(searchText.trim(), 300);
-  const queryClient = useQueryClient();
-
   const accountsQuery = useQuery({
-    queryKey: ['accounts', keyword],
-    queryFn: () => listAccounts(keyword),
+    queryKey: ['accounts', keyword, page],
+    queryFn: () => listAccounts(keyword, page),
   });
-
-  const toggleMutation = useMutation({
-    mutationFn: ({ accountId, schedulable }: { accountId: number; schedulable: boolean }) =>
-      setAccountSchedulable(accountId, schedulable),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['accounts'] }),
-  });
-
-  const testMutation = useMutation({
-    mutationFn: (accountId: number) => testAccount(accountId),
-  });
-
   const items = accountsQuery.data?.items ?? [];
-  const accountCostQueries = useQueries({
+  const todayQueries = useQueries({
     queries: items.map((account) => ({
       queryKey: ['account-today-stats', account.id],
       queryFn: () => getAccountTodayStats(account.id),
       staleTime: 60_000,
     })),
   });
-
-  const todayByAccountId = useMemo(() => {
-    const next = new Map<number, AccountTodaySummary>();
+  const todayById = useMemo(() => {
+    const result = new Map<number, TodaySummary>();
     items.forEach((account, index) => {
-      const result = accountCostQueries[index]?.data;
-      const fromStatsCost = typeof result?.cost === 'number' && Number.isFinite(result.cost) ? result.cost : undefined;
-      const fromExtra = typeof account.extra?.today_cost === 'number' ? account.extra.today_cost : undefined;
-      const cost = fromStatsCost ?? fromExtra ?? 0;
-      const requests = typeof result?.requests === 'number' && Number.isFinite(result.requests) ? result.requests : 0;
-      const tokens = typeof result?.tokens === 'number' && Number.isFinite(result.tokens) ? result.tokens : 0;
-      next.set(account.id, { requests, tokens, cost });
+      const query = todayQueries[index];
+      result.set(account.id, {
+        requests: knownNumber(query?.data?.requests),
+        tokens: knownNumber(query?.data?.tokens),
+        cost: knownNumber(query?.data?.cost),
+        failed: Boolean(query?.isError),
+      });
     });
-    return next;
-  }, [accountCostQueries, items]);
-
-  const filteredItems = useMemo(() => {
-    const statusMatched = items.filter((account) => {
-      const visualStatus = getAccountVisualStatus(account);
-      if (filter === 'all') return true;
-      if (filter === 'active') return visualStatus.filterKey === 'active';
-      if (filter === 'paused') return visualStatus.filterKey === 'paused';
-      if (filter === 'error') return visualStatus.filterKey === 'error';
-      return true;
-    });
-
-    const sorted = [...statusMatched].sort((left, right) => {
-      const requestsLeft = todayByAccountId.get(left.id)?.requests ?? 0;
-      const requestsRight = todayByAccountId.get(right.id)?.requests ?? 0;
-      if (requestsLeft === requestsRight) {
-        const tokensLeft = todayByAccountId.get(left.id)?.tokens ?? 0;
-        const tokensRight = todayByAccountId.get(right.id)?.tokens ?? 0;
-        return tokensLeft - tokensRight;
-      }
-      if (usageSort === 'usage-asc') return requestsLeft - requestsRight;
-      return requestsRight - requestsLeft;
-    });
-
-    return sorted;
-  }, [filter, items, todayByAccountId, usageSort]);
-  const errorMessage = accountsQuery.error instanceof Error ? accountsQuery.error.message : '';
-
-  const summary = useMemo(() => {
-    const total = items.length;
-    const errors = items.filter((item) => getAccountVisualStatus(item).filterKey === 'error').length;
-    const paused = items.filter((item) => getAccountVisualStatus(item).filterKey === 'paused').length;
-    const active = items.filter((item) => getAccountVisualStatus(item).filterKey === 'active').length;
-    return { total, active, paused, errors };
-  }, [items]);
-
-  const listHeader = useMemo(
-    () => (
-      <View className="pb-2">
-        <View className="rounded-[24px] bg-[#fbf8f2] p-2.5">
-          <View className="flex-row items-center rounded-[18px] bg-[#f1ece2] px-4 py-3">
-            <Search color="#7d7468" size={18} />
-            <TextInput
-              defaultValue=""
-              onChangeText={setSearchText}
-              placeholder="搜索账号名称 / 平台"
-              placeholderTextColor="#9b9081"
-              className="ml-3 flex-1 text-base text-[#16181a]"
-            />
-          </View>
-
-          <View className="mt-3 flex-row gap-2">
-            {([
-              ['all', `全部 ${summary.total}`],
-              ['active', `正常 ${summary.active}`],
-              ['paused', `暂停 ${summary.paused}`],
-              ['error', `异常 ${summary.errors}`],
-            ] as const).map(([key, label]) => {
-              const active = filter === key;
-              return (
-                <Pressable
-                  key={key}
-                  onPress={() => setFilter(key)}
-                  className={active ? 'rounded-full bg-[#1d5f55] px-3 py-2' : 'rounded-full bg-[#e7dfcf] px-3 py-2'}
-                >
-                  <Text className={active ? 'text-xs font-semibold text-white' : 'text-xs font-semibold text-[#4e463e]'}>{label}</Text>
-                </Pressable>
-              );
-            })}
-          </View>
-
-          <View className="mt-3 flex-row gap-2">
-            {([
-              ['usage-desc', '请求高→低'],
-              ['usage-asc', '请求低→高'],
-            ] as const).map(([key, label]) => {
-              const active = usageSort === key;
-              return (
-                <Pressable
-                  key={key}
-                  onPress={() => setUsageSort(key)}
-                  className={active ? 'rounded-full bg-[#4e463e] px-3 py-3' : 'rounded-full bg-[#e7dfcf] px-3 py-3'}
-                >
-                  <Text className={active ? 'text-xs font-semibold text-white' : 'text-xs font-semibold text-[#4e463e]'}>{label}</Text>
-                </Pressable>
-              );
-            })}
-          </View>
-        </View>
-      </View>
-    ),
-    [filter, summary.active, summary.errors, summary.paused, summary.total, usageSort]
-  );
-
-  const renderItem = useCallback(
-    ({ item: account }: { item: (typeof filteredItems)[number] }) => {
-      const isError = getAccountError(account);
-      const visualStatus = getAccountVisualStatus(account);
-      const statusText = visualStatus.label;
-      const groupsText = account.groups?.map((group) => group.name).filter(Boolean).slice(0, 3).join(' · ');
-      const todayStats = todayByAccountId.get(account.id) ?? { requests: 0, tokens: 0, cost: 0 };
-      const nextSchedulable = visualStatus.filterKey === 'paused';
-      const toggleLabel = nextSchedulable ? '恢复' : '暂停';
-      const testFeedback = testFeedbackByAccountId[account.id];
-      const isTogglingCurrent = togglingAccountId === account.id && toggleMutation.isPending;
-      const isTestingCurrent = testingAccountId === account.id && testMutation.isPending;
-
-      return (
-        <View>
-          <ListCard
-            title={account.name}
-            meta={`${account.platform} · ${account.type}`}
-            badge={statusText}
-            badgeTone={visualStatus.badgeTone}
-            icon={KeyRound}
-          >
-            <View className="gap-3">
-              <View className="flex-row items-center justify-between">
-                <View className="flex-row items-center gap-2">
-                  {account.schedulable && !isError ? <ShieldCheck color="#7d7468" size={14} /> : <ShieldOff color="#7d7468" size={14} />}
-                  <Text className="text-sm text-[#7d7468]">状态：{statusText}</Text>
-                </View>
-                <Text className="text-xs text-[#7d7468]">最近使用 {formatTime(account.last_used_at || account.updated_at)}</Text>
-              </View>
-
-              <View className="flex-row gap-2">
-                <View className="flex-1 rounded-[14px] bg-[#f1ece2] px-3 py-3">
-                  <Text className="text-[11px] text-[#7d7468]">请求次数</Text>
-                  <Text className="mt-1 text-sm font-bold text-[#16181a]">{todayStats.requests}</Text>
-                </View>
-                <View className="flex-1 rounded-[14px] bg-[#f1ece2] px-3 py-3">
-                  <Text className="text-[11px] text-[#7d7468]">消费金额</Text>
-                  <Text className="mt-1 text-sm font-bold text-[#16181a]">${todayStats.cost.toFixed(2)}</Text>
-                </View>
-                <View className="flex-1 rounded-[14px] bg-[#f1ece2] px-3 py-3">
-                  <Text className="text-[11px] text-[#7d7468]">token消耗</Text>
-                  <Text className="mt-1 text-sm font-bold text-[#16181a]">{formatTokenValue(todayStats.tokens)}</Text>
-                </View>
-              </View>
-
-              <Text className="text-xs text-[#7d7468]">优先级 {account.priority ?? 0} · 倍率 {(account.rate_multiplier ?? 1).toFixed(2)}x</Text>
-
-              {groupsText ? <Text className="text-xs text-[#7d7468]">分组 {groupsText}</Text> : null}
-              {account.error_message ? <Text className="text-xs text-[#a4512b]">异常信息：{account.error_message}</Text> : null}
-
-              <View className="flex-row gap-2">
-                <Pressable
-                  className="rounded-full bg-[#1b1d1f] px-4 py-2"
-                  disabled={isTestingCurrent}
-                  onPress={(event) => {
-                    event.stopPropagation();
-                    setTestingAccountId(account.id);
-                    testMutation.mutate(account.id, {
-                      onSuccess: () => {
-                        setTestFeedbackByAccountId((current) => ({ ...current, [account.id]: '测试成功' }));
-                      },
-                      onError: (error) => {
-                        const message = error instanceof Error && error.message ? error.message : '测试失败';
-                        setTestFeedbackByAccountId((current) => ({ ...current, [account.id]: message }));
-                      },
-                      onSettled: () => {
-                        setTestingAccountId((current) => (current === account.id ? null : current));
-                      },
-                    });
-                  }}
-                >
-                  <Text className="text-xs font-semibold uppercase tracking-[1.2px] text-[#f6f1e8]">{isTestingCurrent ? '测试中...' : '测试'}</Text>
-                </Pressable>
-                <Pressable
-                  className="rounded-full bg-[#e7dfcf] px-4 py-2"
-                  disabled={isTogglingCurrent}
-                  onPress={(event) => {
-                    event.stopPropagation();
-                    setTogglingAccountId(account.id);
-                    toggleMutation.mutate({
-                      accountId: account.id,
-                      schedulable: nextSchedulable,
-                    }, {
-                      onSettled: () => {
-                        setTogglingAccountId((current) => (current === account.id ? null : current));
-                      },
-                    });
-                  }}
-                >
-                  <Text className="text-xs font-semibold uppercase tracking-[1.2px] text-[#4e463e]">{isTogglingCurrent ? '处理中...' : toggleLabel}</Text>
-                </Pressable>
-              </View>
-
-              {testFeedback ? <Text className="text-xs text-[#1d5f55]">测试结果：{testFeedback}</Text> : null}
-            </View>
-          </ListCard>
-        </View>
-      );
-    },
-    [testFeedbackByAccountId, testMutation, testingAccountId, todayByAccountId, toggleMutation, togglingAccountId]
-  );
-
-  const emptyState = useMemo(
-    () => <ListCard title="暂无账号" meta={errorMessage || '连上后这里会展示账号列表。'} icon={KeyRound} />,
-    [errorMessage]
-  );
+    return result;
+  }, [items, todayQueries]);
+  const visible = useMemo(() => items
+    .filter((item) => filter === 'all' || getVisualStatus(item, statusTime).key === filter)
+    .sort((a, b) => {
+      const left = todayById.get(a.id)?.requests;
+      const right = todayById.get(b.id)?.requests;
+      if (left === undefined) return right === undefined ? 0 : 1;
+      if (right === undefined) return -1;
+      return usageSort === 'usage-desc' ? right - left : left - right;
+    }), [filter, items, todayById, usageSort, statusTime]);
+  const pages = Math.max(1, accountsQuery.data?.pages ?? Math.ceil((accountsQuery.data?.total ?? 0) / 20));
+  const refresh = async () => {
+    setStatusTime(Date.now());
+    setRefreshing(true);
+    try {
+      await Promise.all([accountsQuery.refetch(), ...todayQueries.map((query) => query.refetch())]);
+    } finally {
+      setRefreshing(false);
+    }
+  };
 
   return (
     <ScreenShell
       title="账号清单"
-      subtitle="查看名称、平台&类型、请求次数、消费金额、token消耗，并支持筛选与排序。"
-      titleAside={(
-        <Text className="text-[11px] text-[#7d7468]">更接近网页后台的账号视图。</Text>
-      )}
+      subtitle="查询用量、账号限额和重置卡，点击账号管理。"
       variant="minimal"
       scroll={false}
       safeAreaEdges={safeAreaEdges}
@@ -317,15 +124,80 @@ export function AccountsListScreen({ safeAreaEdges }: AccountsListScreenProps) {
       <FlatList
         style={{ flex: 1 }}
         contentContainerStyle={{ paddingBottom: 12, flexGrow: 1 }}
-        data={filteredItems}
-        renderItem={renderItem}
-        keyExtractor={(item) => `${item.id}`}
-        showsVerticalScrollIndicator={false}
-        refreshControl={<RefreshControl refreshing={accountsQuery.isRefetching} onRefresh={() => void accountsQuery.refetch()} tintColor="#1d5f55" />}
-        ListHeaderComponent={listHeader}
-        ListEmptyComponent={emptyState}
-        ItemSeparatorComponent={() => <View className="h-4" />}
+        data={visible}
+        keyExtractor={(item) => String(item.id)}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} tintColor="#1d5f55" />}
+        ListHeaderComponent={(
+          <View className="pb-3">
+            <View className="flex-row items-center rounded-[18px] bg-[#f1ece2] px-4 py-3">
+              <Search color="#7d7468" size={18} />
+              <TextInput
+                value={searchText}
+                onChangeText={(value) => { setSearchText(value); setPage(1); }}
+                placeholder="搜索账号名称"
+                placeholderTextColor="#9b9081"
+                className="ml-3 flex-1 text-base text-[#16181a]"
+              />
+            </View>
+            <View className="mt-3 flex-row flex-wrap gap-2">
+              {([['all', '全部'], ['active', '正常'], ['paused', '暂停'], ['error', '异常']] as const).map(([key, label]) => (
+                <Pressable key={key} onPress={() => setFilter(key)} className={filter === key ? 'rounded-full bg-[#1d5f55] px-3 py-2' : 'rounded-full bg-[#e7dfcf] px-3 py-2'}>
+                  <Text className={filter === key ? 'text-xs font-semibold text-white' : 'text-xs font-semibold text-[#4e463e]'}>{label}</Text>
+                </Pressable>
+              ))}
+              <Pressable onPress={() => setUsageSort((current) => current === 'usage-desc' ? 'usage-asc' : 'usage-desc')} className="rounded-full bg-[#4e463e] px-3 py-2">
+                <Text className="text-xs font-semibold text-white">{usageSort === 'usage-desc' ? '请求高→低' : '请求低→高'}</Text>
+              </Pressable>
+            </View>
+            <Text className="mt-2 text-xs text-[#7d7468]">共 {accountsQuery.data?.total ?? '--'} 个账号 · 第 {page}/{pages} 页 · 状态筛选和用量排序作用于本页</Text>
+            {accountsQuery.isError ? (
+              <View className="mt-3 rounded-xl bg-[#f7e1d6] p-3">
+                <Text className="text-sm text-[#a4512b]">账号加载失败：{accountsQuery.error instanceof Error ? accountsQuery.error.message : '请重试'}</Text>
+                <Pressable onPress={() => void accountsQuery.refetch()} className="mt-2 py-2"><Text className="font-semibold text-[#a4512b]">重试</Text></Pressable>
+              </View>
+            ) : null}
+          </View>
+        )}
+        renderItem={({ item }) => {
+          const status = getVisualStatus(item, statusTime);
+          const today = todayById.get(item.id);
+          return (
+            <Pressable accessibilityRole="button" accessibilityLabel={`查看账号 ${item.name}`} onPress={() => router.push({ pathname: '/accounts/[id]', params: { id: String(item.id) } })}>
+              <ListCard title={item.name} meta={`${item.platform} · ${item.type}`} badge={status.label} badgeTone={status.tone} icon={KeyRound}>
+                <View className="flex-row gap-2">
+                  {[
+                    ['今日请求', today?.requests === undefined ? '--' : String(today.requests)],
+                    ['今日消费', today?.cost === undefined ? '--' : `$${today.cost.toFixed(2)}`],
+                    ['今日 Token', today?.tokens === undefined ? '--' : formatTokenValue(today.tokens)],
+                  ].map(([label, value]) => (
+                    <View key={label} className="flex-1 rounded-xl bg-[#f1ece2] p-3">
+                      <Text className="text-[11px] text-[#7d7468]">{label}</Text>
+                      <Text className="mt-1 text-sm font-bold text-[#16181a]">{value}</Text>
+                    </View>
+                  ))}
+                </View>
+                {today?.failed ? <Text className="mt-2 text-xs text-[#a4512b]">今日统计暂不可用，可下拉重试。</Text> : null}
+                {item.error_message ? <Text numberOfLines={2} className="mt-2 text-xs text-[#a4512b]">{item.error_message}</Text> : null}
+                <View className="mt-3 flex-row items-center justify-between">
+                  <Text className="flex-1 text-xs text-[#7d7468]">{item.groups?.map((group) => group.name).join(' · ') || '未分组'}</Text>
+                  <Text className="text-xs font-semibold text-[#1d5f55]">查看额度与管理</Text>
+                  <ChevronRight size={14} color="#1d5f55" />
+                </View>
+              </ListCard>
+            </Pressable>
+          );
+        }}
+        ListEmptyComponent={accountsQuery.isLoading ? <ActivityIndicator className="mt-10" color="#1d5f55" /> : !accountsQuery.isError ? <ListCard title="暂无匹配账号" meta="尝试其他搜索条件或状态筛选。" icon={KeyRound} /> : null}
+        ListFooterComponent={(
+          <View className="mt-4 flex-row items-center justify-between gap-3">
+            <Pressable disabled={page <= 1 || accountsQuery.isFetching} onPress={() => setPage((current) => current - 1)} className="rounded-xl bg-[#e7dfcf] px-5 py-3" style={{ opacity: page <= 1 || accountsQuery.isFetching ? 0.45 : 1 }}><Text className="font-semibold text-[#4e463e]">上一页</Text></Pressable>
+            <Text className="text-sm text-[#7d7468]">{page}/{pages}</Text>
+            <Pressable disabled={page >= pages || accountsQuery.isFetching} onPress={() => setPage((current) => current + 1)} className="rounded-xl bg-[#1d5f55] px-5 py-3" style={{ opacity: page >= pages || accountsQuery.isFetching ? 0.45 : 1 }}><Text className="font-semibold text-white">下一页</Text></Pressable>
+          </View>
+        )}
+        ItemSeparatorComponent={() => <View className="h-3" />}
         keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator={false}
         initialNumToRender={8}
         maxToRenderPerBatch={8}
         windowSize={5}

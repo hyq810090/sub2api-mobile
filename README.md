@@ -14,8 +14,12 @@ Mobile-first admin console for Sub2API operations, built with Expo + React Nativ
 
 - Cross-platform app (iOS / Android / Web) for operational and admin workflows.
 - Server health and metrics monitoring views.
-- User, API key, account, and group management pages.
+- User balances/status, API key quotas, account usage, reset credits, and subscription quota management.
 - Multi-account admin server switching in settings.
+
+Android 1.1.0 focuses on daily queries and management, with four tabs: overview,
+users, accounts, and servers. See the [mobile management guide](docs/MOBILE_MANAGEMENT.md)
+for supported actions, backend requirements, and validation instructions.
 
 ## Tech Stack
 

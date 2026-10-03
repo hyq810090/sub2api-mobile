@@ -1,15 +1,14 @@
-import { useQueries, useQuery } from '@tanstack/react-query';
+import { useInfiniteQuery } from '@tanstack/react-query';
 import { router } from 'expo-router';
 import { useMemo, useState } from 'react';
-import { FlatList, Pressable, RefreshControl, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, FlatList, Pressable, RefreshControl, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useDebouncedValue } from '@/src/hooks/use-debounced-value';
-import { formatCompactNumber, formatTokenValue } from '@/src/lib/formatters';
 import { queryClient } from '@/src/lib/query-client';
-import { getUser, getUsageStats, listUserApiKeys, listUsers } from '@/src/services/admin';
+import { getUser, listUsers } from '@/src/services/admin';
 import { adminConfigState, hasAuthenticatedAdminSession } from '@/src/store/admin-config';
-import type { AdminUser, UsageStats } from '@/src/types/admin';
+import type { AdminUser } from '@/src/types/admin';
 
 const { useSnapshot } = require('valtio/react');
 
@@ -21,70 +20,8 @@ const colors = {
   text: '#16181a',
   subtext: '#6f665c',
   dangerBg: '#fbf1eb',
-  danger: '#c25d35',
-  accentBg: '#efe4cf',
-  accentText: '#8c5a22',
+  danger: '#a4512b',
 };
-
-type SortOrder = 'desc' | 'asc';
-type RangeKey = '24h' | '7d' | '30d';
-
-function getDateRange(rangeKey: RangeKey) {
-  const end = new Date();
-  const start = new Date();
-
-  if (rangeKey === '24h') {
-    start.setHours(end.getHours() - 23, 0, 0, 0);
-  } else if (rangeKey === '30d') {
-    start.setDate(end.getDate() - 29);
-  } else {
-    start.setDate(end.getDate() - 6);
-  }
-
-  const toDate = (value: Date) => value.toISOString().slice(0, 10);
-
-  return {
-    start_date: toDate(start),
-    end_date: toDate(end),
-    granularity: rangeKey === '24h' ? ('hour' ) : ('day' ),
-  };
-}
-
-function formatCost(value?: number) {
-  if (typeof value !== 'number' || Number.isNaN(value)) return '$0.00';
-  return `$${value.toFixed(2)}`;
-}
-
-function formatActivityTime(value?: string) {
-  if (!value) return '时间未知';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '时间未知';
-
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  const hours = String(date.getHours()).padStart(2, '0');
-  const minutes = String(date.getMinutes()).padStart(2, '0');
-  const seconds = String(date.getSeconds()).padStart(2, '0');
-
-  return `${year}/${month}/${day} ${hours}:${minutes}:${seconds}`;
-}
-
-function toTimeValue(value?: string | null) {
-  if (!value) return 0;
-  const time = new Date(value).getTime();
-  return Number.isNaN(time) ? 0 : time;
-}
-
-function getTimeValue(user: AdminUser) {
-  return toTimeValue(user.last_used_at) || toTimeValue(user.updated_at) || toTimeValue(user.created_at) || user.id || 0;
-}
-
-function getUserNameLabel(user: AdminUser) {
-  if (user.username?.trim()) return user.username.trim();
-  if (user.notes?.trim()) return user.notes.trim();
-  return user.email.split('@')[0] || '未命名';
-}
 
 function getErrorMessage(error: unknown) {
   if (error instanceof Error && error.message) {
@@ -92,54 +29,49 @@ function getErrorMessage(error: unknown) {
       case 'BASE_URL_REQUIRED':
         return '请先到服务器页填写服务地址。';
       case 'ADMIN_API_KEY_REQUIRED':
-        return '请先到服务器页填写 Admin Token。';
+        return '请先到服务器页填写 Admin Key。';
       default:
         return error.message;
     }
   }
-
-  return '当前无法加载页面数据，请检查服务地址、Token 和网络。';
+  return '加载失败，请检查服务器连接后重试。';
 }
 
-function MetricTile({ title, value, tone = 'default' }: { title: string; value: string; tone?: 'default' | 'accent' }) {
-  const backgroundColor = tone === 'accent' ? colors.accentBg : colors.mutedCard;
-  const valueColor = tone === 'accent' ? colors.accentText : colors.text;
-
-  return (
-    <View style={{ flex: 1, minWidth: 0, backgroundColor, borderRadius: 14, paddingHorizontal: 10, paddingVertical: 12 }}>
-      <Text style={{ fontSize: 11, color: colors.subtext }}>{title}</Text>
-      <Text numberOfLines={1} style={{ marginTop: 6, fontSize: 16, fontWeight: '800', color: valueColor }}>
-        {value}
-      </Text>
-    </View>
-  );
+function formatMoney(value?: number) {
+  return typeof value === 'number' && Number.isFinite(value) ? `$${value.toFixed(2)}` : '--';
 }
 
-function UserCard({ user, usage }: { user: AdminUser; usage?: UsageStats }) {
+function UserCard({ user }: { user: AdminUser }) {
+  const disabled = user.status === 'inactive' || user.status === 'disabled';
+  const status = disabled ? '已禁用' : user.status === 'active' || !user.status ? '正常' : user.status;
   const isAdmin = user.role?.trim().toLowerCase() === 'admin';
-  const userNameLabel = getUserNameLabel(user);
-  const statusLabel = `${isAdmin ? 'admin · ' : ''}${user.status || 'active'} · ${userNameLabel}`;
-  const totalCost = Number(usage?.total_account_cost ?? usage?.total_actual_cost ?? usage?.total_cost ?? 0);
-  const totalTokens = Number(usage?.total_tokens ?? 0);
-  const totalRequests = Number(usage?.total_requests ?? 0);
 
   return (
-    <View style={{ backgroundColor: colors.card, borderRadius: 18, padding: 14 }}>
-      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12 }}>
+    <View style={{ backgroundColor: colors.card, borderRadius: 18, padding: 16, gap: 12 }}>
+      <View style={{ flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 10 }}>
         <View style={{ flex: 1 }}>
-          <Text numberOfLines={1} style={{ fontSize: 16, fontWeight: '800', color: colors.text }}>{user.email}</Text>
-          <Text style={{ marginTop: 4, fontSize: 12, color: colors.subtext }}>最近使用 {formatActivityTime(user.last_used_at || user.updated_at || user.created_at)}</Text>
+          <Text numberOfLines={1} style={{ fontSize: 16, fontWeight: '700', color: colors.text }}>{user.username?.trim() || user.email}</Text>
+          <Text numberOfLines={1} style={{ marginTop: 5, fontSize: 12, color: colors.subtext }}>{user.email} · #{user.id}</Text>
         </View>
-        <View style={{ alignSelf: 'flex-start', backgroundColor: user.status === 'inactive' || user.status === 'disabled' ? '#cfc5b7' : colors.primary, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6 }}>
-          <Text style={{ fontSize: 10, fontWeight: '700', color: '#fff' }}>{statusLabel}</Text>
+        <View style={{ backgroundColor: disabled ? '#ece5da' : '#dff4ea', borderRadius: 999, paddingHorizontal: 10, paddingVertical: 6 }}>
+          <Text style={{ fontSize: 11, fontWeight: '700', color: disabled ? colors.subtext : colors.primary }}>{status}</Text>
         </View>
       </View>
-
-      <View style={{ flexDirection: 'row', gap: 8, marginTop: 12 }}>
-        <MetricTile title="消费" value={formatCost(totalCost)} tone="accent" />
-        <MetricTile title="总 Token" value={formatTokenValue(totalTokens)} />
-        <MetricTile title="总请求" value={formatCompactNumber(totalRequests)} />
+      <View style={{ flexDirection: 'row', gap: 8 }}>
+        <View style={{ flex: 1, backgroundColor: colors.mutedCard, borderRadius: 12, padding: 12 }}>
+          <Text style={{ fontSize: 11, color: colors.subtext }}>余额</Text>
+          <Text style={{ marginTop: 5, fontSize: 17, fontWeight: '700', color: colors.primary }}>{formatMoney(user.balance)}</Text>
+        </View>
+        <View style={{ flex: 1, backgroundColor: colors.mutedCard, borderRadius: 12, padding: 12 }}>
+          <Text style={{ fontSize: 11, color: colors.subtext }}>并发上限</Text>
+          <Text style={{ marginTop: 5, fontSize: 17, fontWeight: '700', color: colors.text }}>{user.concurrency ?? '--'}</Text>
+        </View>
+        <View style={{ justifyContent: 'center', paddingHorizontal: 4 }}>
+          <Text style={{ fontSize: 11, color: colors.subtext }}>{isAdmin ? '管理员' : '用户'}</Text>
+          <Text style={{ marginTop: 6, fontSize: 12, fontWeight: '700', color: colors.primary }}>详情 ›</Text>
+        </View>
       </View>
+      {user.notes?.trim() ? <Text numberOfLines={2} style={{ fontSize: 12, lineHeight: 18, color: colors.subtext }}>{user.notes.trim()}</Text> : null}
     </View>
   );
 }
@@ -148,130 +80,117 @@ export default function UsersScreen() {
   const config = useSnapshot(adminConfigState);
   const hasAccount = hasAuthenticatedAdminSession(config);
   const [searchText, setSearchText] = useState('');
-  const [sortOrder, setSortOrder] = useState<SortOrder>('desc');
-  const debouncedSearchText = useDebouncedValue(searchText, 250);
+  const keyword = useDebouncedValue(searchText.trim(), 250);
 
-  const usersQuery = useQuery({
-    queryKey: ['users', debouncedSearchText],
-    queryFn: () => listUsers(debouncedSearchText),
+  const usersQuery = useInfiniteQuery({
+    queryKey: ['users', config.activeAccountId, keyword],
+    initialPageParam: 1,
+    queryFn: ({ pageParam }) => listUsers(keyword, pageParam),
+    getNextPageParam: (lastPage) => {
+      if (!lastPage.items.length) return undefined;
+      const pageSize = lastPage.page_size || 20;
+      return lastPage.page * pageSize < lastPage.total ? lastPage.page + 1 : undefined;
+    },
     enabled: hasAccount,
   });
 
-  const usageRange = useMemo(() => getDateRange('7d'), []);
-
   const users = useMemo(() => {
-    const items = [...(usersQuery.data?.items ?? [])];
-    items.sort((left, right) => {
-      const value = getTimeValue(left) - getTimeValue(right);
-      return sortOrder === 'desc' ? -value : value;
-    });
-    return items;
-  }, [sortOrder, usersQuery.data?.items]);
+    const unique = new Map<number, AdminUser>();
+    for (const page of usersQuery.data?.pages ?? []) {
+      for (const user of page.items) unique.set(user.id, user);
+    }
+    return [...unique.values()];
+  }, [usersQuery.data?.pages]);
+  const total = usersQuery.data?.pages[0]?.total;
 
-  const usageQueries = useQueries({
-    queries: users.map((user) => ({
-      queryKey: ['usage-stats', 'user', user.id, '7d', usageRange.start_date, usageRange.end_date],
-      queryFn: () => getUsageStats({ ...usageRange, user_id: user.id }),
-      enabled: hasAccount,
-      staleTime: 60_000,
-    })),
-  });
-
-  const usageByUserId = useMemo(
-    () => new Map(users.map((user, index) => [user.id, usageQueries[index]?.data] as const)),
-    [users, usageQueries]
-  );
-
-  const errorMessage = getErrorMessage(usersQuery.error);
+  const loadMore = () => {
+    if (usersQuery.hasNextPage && !usersQuery.isFetching) void usersQuery.fetchNextPage();
+  };
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: colors.page }}>
       <View style={{ flex: 1, paddingHorizontal: 16, paddingTop: 14 }}>
-        <View style={{ marginBottom: 10, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
-          <View style={{ flex: 1 }}>
-            <Text style={{ fontSize: 28, fontWeight: '700', color: colors.text }}>用户</Text>
-            <Text style={{ marginTop: 4, fontSize: 12, color: '#8a8072' }}>查看用户列表并进入详情页管理账号。</Text>
-          </View>
-          <Pressable
-            onPress={() => router.push('/users/create-user')}
-            style={{
-              width: 40,
-              height: 40,
-              borderRadius: 12,
-              backgroundColor: colors.primary,
-              alignItems: 'center',
-              justifyContent: 'center',
-            }}
-          >
-            <Text style={{ color: '#fff', fontSize: 24, lineHeight: 24, fontWeight: '500' }}>+</Text>
-          </Pressable>
+        <View style={{ marginBottom: 12 }}>
+          <Text style={{ fontSize: 28, fontWeight: '700', color: colors.text }}>用户</Text>
+          <Text style={{ marginTop: 5, fontSize: 12, color: colors.subtext }}>查询余额、额度与订阅，进入详情执行管理操作。</Text>
         </View>
 
-        <View style={{ flexDirection: 'row', gap: 10, alignItems: 'center' }}>
-          <View style={{ flex: 1, backgroundColor: colors.card, borderRadius: 16, padding: 10 }}>
-            <TextInput
-              value={searchText}
-              onChangeText={setSearchText}
-              placeholder="搜索邮箱、用户名或备注"
-              placeholderTextColor="#9b9081"
-              style={{ backgroundColor: colors.mutedCard, borderRadius: 14, paddingHorizontal: 14, paddingVertical: 11, fontSize: 15, color: colors.text }}
-            />
-          </View>
-          <Pressable
-            onPress={() => setSortOrder((value) => (value === 'desc' ? 'asc' : 'desc'))}
-            style={{ backgroundColor: colors.card, borderRadius: 16, paddingHorizontal: 14, paddingVertical: 14, minWidth: 92, alignItems: 'center' }}
-          >
-            <Text style={{ fontSize: 11, color: colors.subtext }}>时间</Text>
-            <Text style={{ marginTop: 4, fontSize: 13, fontWeight: '700', color: colors.text }}>{sortOrder === 'desc' ? '倒序' : '正序'}</Text>
-          </Pressable>
+        <View style={{ backgroundColor: colors.card, borderRadius: 16, padding: 10 }}>
+          <TextInput
+            value={searchText}
+            onChangeText={setSearchText}
+            placeholder="搜索邮箱、用户名或备注"
+            placeholderTextColor="#9b9081"
+            autoCapitalize="none"
+            autoCorrect={false}
+            returnKeyType="search"
+            accessibilityLabel="搜索用户"
+            style={{ backgroundColor: colors.mutedCard, borderRadius: 14, paddingHorizontal: 14, paddingVertical: 12, fontSize: 15, color: colors.text }}
+          />
         </View>
+
+        {typeof total === 'number' ? <Text style={{ marginTop: 10, marginBottom: 2, fontSize: 12, color: colors.subtext }}>已显示 {users.length} / {total} 位用户</Text> : null}
 
         {!hasAccount ? (
-          <View style={{ marginTop: 10, backgroundColor: colors.card, borderRadius: 18, padding: 16 }}>
+          <View style={{ marginTop: 12, backgroundColor: colors.card, borderRadius: 18, padding: 16, gap: 10 }}>
             <Text style={{ fontSize: 18, fontWeight: '700', color: colors.text }}>未连接服务器</Text>
-            <Text style={{ marginTop: 8, fontSize: 14, lineHeight: 22, color: colors.subtext }}>请先到“服务器”页完成连接，再查看用户列表。</Text>
-            <Pressable
-              style={{ marginTop: 14, alignSelf: 'flex-start', backgroundColor: colors.primary, borderRadius: 14, paddingHorizontal: 16, paddingVertical: 12 }}
-              onPress={() => router.push('/settings')}
-            >
-              <Text style={{ color: '#fff', fontSize: 13, fontWeight: '700' }}>去配置服务器</Text>
+            <Text style={{ color: colors.subtext }}>请先连接服务器，再查询用户。</Text>
+            <Pressable onPress={() => router.push('/settings')} style={{ paddingVertical: 12 }}>
+              <Text style={{ color: colors.primary, fontWeight: '700' }}>连接服务器 ›</Text>
             </Pressable>
           </View>
-        ) : usersQuery.isLoading ? (
-          <View style={{ marginTop: 10, backgroundColor: colors.card, borderRadius: 18, padding: 16 }}>
-            <Text style={{ fontSize: 18, fontWeight: '700', color: colors.text }}>正在加载用户</Text>
-            <Text style={{ marginTop: 8, fontSize: 14, lineHeight: 22, color: colors.subtext }}>已连接服务器，正在拉取用户列表。</Text>
-          </View>
-        ) : usersQuery.error ? (
-          <View style={{ marginTop: 10, backgroundColor: colors.card, borderRadius: 18, padding: 16 }}>
-            <Text style={{ fontSize: 18, fontWeight: '700', color: colors.text }}>加载失败</Text>
-            <View style={{ marginTop: 12, borderRadius: 14, backgroundColor: colors.dangerBg, paddingHorizontal: 14, paddingVertical: 12 }}>
-              <Text style={{ color: colors.danger, fontSize: 14, lineHeight: 20 }}>{errorMessage}</Text>
-            </View>
+        ) : usersQuery.isPending ? (
+          <View style={{ marginTop: 24, alignItems: 'center', gap: 12 }}>
+            <ActivityIndicator color={colors.primary} />
+            <Text style={{ color: colors.subtext }}>正在加载用户…</Text>
           </View>
         ) : (
           <FlatList
             style={{ marginTop: 10, flex: 1 }}
             data={users}
-            keyExtractor={(item) => `${item.id}`}
+            keyExtractor={(item) => String(item.id)}
             showsVerticalScrollIndicator={false}
-            refreshControl={<RefreshControl refreshing={usersQuery.isRefetching} onRefresh={() => void usersQuery.refetch()} tintColor="#1d5f55" />}
-            contentContainerStyle={{ paddingBottom: 8, gap: 12, flexGrow: users.length === 0 ? 1 : 0 }}
-            ListEmptyComponent={
-              <View style={{ backgroundColor: colors.card, borderRadius: 18, padding: 16 }}>
-                <Text style={{ fontSize: 18, fontWeight: '700', color: colors.text }}>暂无用户</Text>
-                <Text style={{ marginTop: 8, fontSize: 14, lineHeight: 22, color: colors.subtext }}>当前搜索条件下没有匹配结果，可以修改关键词后重试。</Text>
+            keyboardShouldPersistTaps="handled"
+            initialNumToRender={8}
+            maxToRenderPerBatch={8}
+            refreshControl={<RefreshControl refreshing={usersQuery.isRefetching} onRefresh={() => void usersQuery.refetch()} tintColor={colors.primary} />}
+            contentContainerStyle={{ paddingBottom: 24, gap: 12, flexGrow: users.length === 0 ? 1 : 0 }}
+            ListHeaderComponent={usersQuery.isError && !usersQuery.isFetchNextPageError ? (
+              <View style={{ backgroundColor: colors.dangerBg, borderRadius: 14, padding: 14, gap: 10 }}>
+                <Text style={{ color: colors.danger }}>用户列表加载失败：{getErrorMessage(usersQuery.error)}</Text>
+                <Pressable onPress={() => void usersQuery.refetch()} style={{ paddingVertical: 8 }}>
+                  <Text style={{ color: colors.primary, fontWeight: '700' }}>重试</Text>
+                </Pressable>
               </View>
-            }
+            ) : null}
+            ListEmptyComponent={!usersQuery.isError ? (
+              <View style={{ backgroundColor: colors.card, borderRadius: 18, padding: 16, gap: 8 }}>
+                <Text style={{ fontSize: 18, fontWeight: '700', color: colors.text }}>暂无用户</Text>
+                <Text style={{ fontSize: 14, lineHeight: 22, color: colors.subtext }}>当前条件下没有匹配结果，可修改关键词后重试。</Text>
+              </View>
+            ) : null}
+            ListFooterComponent={usersQuery.hasNextPage || usersQuery.isFetchNextPageError ? (
+              <View style={{ gap: 10, paddingVertical: 8 }}>
+                {usersQuery.isFetchNextPageError ? <Text style={{ color: colors.danger }}>下一页加载失败：{getErrorMessage(usersQuery.error)}</Text> : null}
+                <Pressable
+                  disabled={usersQuery.isFetching}
+                  onPress={loadMore}
+                  style={{ backgroundColor: colors.card, borderRadius: 14, paddingVertical: 15, alignItems: 'center', opacity: usersQuery.isFetching ? 0.6 : 1 }}
+                >
+                  <Text style={{ color: colors.primary, fontWeight: '700' }}>{usersQuery.isFetchingNextPage ? '加载中…' : usersQuery.isFetchNextPageError ? '重试加载下一页' : '加载更多用户'}</Text>
+                </Pressable>
+              </View>
+            ) : users.length > 0 ? <Text style={{ paddingVertical: 12, textAlign: 'center', color: colors.subtext, fontSize: 12 }}>已加载全部用户</Text> : null}
             renderItem={({ item }) => (
               <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={`查看用户 ${item.email}`}
                 onPress={() => {
                   void queryClient.prefetchQuery({ queryKey: ['user', item.id], queryFn: () => getUser(item.id) });
-                  void queryClient.prefetchQuery({ queryKey: ['user-api-keys', item.id], queryFn: () => listUserApiKeys(item.id) });
                   router.push(`/users/${item.id}`);
                 }}
               >
-                <UserCard user={item} usage={usageByUserId.get(item.id)} />
+                <UserCard user={item} />
               </Pressable>
             )}
           />

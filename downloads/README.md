@@ -1,22 +1,22 @@
-# Android 安装包
+# Android 安装包下载
 
-[下载 sub2api-mobile-1.0.0.apk](https://github.com/hyq810090/sub2api-mobile/raw/refs/heads/apk-download/downloads/sub2api-mobile-1.0.0.apk)
+新版 **1.1.0**：支持账号限额查询、Claude / OpenAI 重置卡查询与使用、用户订阅额度重置与延期、API Key 额度、余额和状态管理。手机导航精简为概览、用户、账号、服务器。
 
-- 版本：1.0.0（versionCode 1）
-- 包名：com.ppx.sub2apimobile
-- 支持 Android 7.0 及以上，ARM64 / ARMv7
-- 已内置应用代码，启动不依赖开发服务器
-- 使用本地测试签名，适合个人安装；没有使用 EAS 正式签名
-- APK 签名、ZIP 完整性和 16 KB 对齐检查通过；尚未实机验证
+[直接下载 sub2api-mobile-1.1.0.apk](https://github.com/hyq810090/sub2api-mobile/raw/refs/heads/apk-download/downloads/sub2api-mobile-1.1.0.apk)
 
-下载到手机后打开 APK，按系统提示允许当前下载来源安装应用。安装后填写你的 Sub2API 后台地址和管理员密钥。
-如果手机已有同包名、不同签名的版本，系统可能拒绝覆盖安装。请先备份已有配置；卸载会清除本地数据。
+- Android 7.0 或更新，支持 ARM64 / ARMv7，约 62.9 MiB。
+- 独立 Release 安装包，无需开发服务器。输入你的 Sub2API 地址及 Admin Key 即可连接；具体功能取决于后台版本和账号资格。
+- 与之前 1.0.0 使用相同测试签名，可以覆盖升级；正式发行需要自己的发行签名。
+- 类型检查、22 项模拟接口契约、手机宽度浏览器操作检查、APK 签名及结构检查已通过。未连接真实后台或进行手机实机验证。
+- 源码：[mobile-management](https://github.com/hyq810090/sub2api-mobile/tree/mobile-management)，对应提交 `c33583d6b2e86d9f0e42999a919eabcddc8991f1`。本下载分支也包含新版源码。
+- [功能及后台要求](../docs/MOBILE_MANAGEMENT.md)
 
-源码对应提交：3177500f74b005ed32512d3f79a7a24d05eac352
+手机浏览器打开上面的下载链接；如先看到文件页面，点 **Download raw file**。安装时按手机提示允许当前浏览器安装应用。
 
 SHA-256：
-```
-6a33179e6b2327d511a2bf5126fe82c9160918568c1fa83c8bb9479a87710bdf
+
+```text
+4cbccf56350ceabcc4c2cf6c72c8909fc3100209913ebb55f6262e18dcafab5b  sub2api-mobile-1.1.0.apk
 ```
 
-此分支仅增加安装包和本说明，main 分支不受影响。
+旧版仍保留：[sub2api-mobile-1.0.0.apk](sub2api-mobile-1.0.0.apk)。

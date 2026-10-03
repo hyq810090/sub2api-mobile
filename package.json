@@ -1,6 +1,6 @@
 {
   "name": "sub2api-mobile",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "main": "expo-router/entry",
   "scripts": {
     "start": "expo start",
@@ -16,7 +16,10 @@
     "eas:update:production": "eas update --branch production --message",
     "start:dev-client": "expo start --dev-client",
     "eas:build:development:android": "eas build -p android --profile development",
-    "eas:build:development:ios": "eas build -p ios --profile development"
+    "eas:build:development:ios": "eas build -p ios --profile development",
+    "typecheck": "tsc --noEmit",
+    "test": "node tests/management-contracts.cjs",
+    "test:browser": "node tests/mobile-management.browser.cjs"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.1.1",
